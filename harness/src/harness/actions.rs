@@ -1,5 +1,6 @@
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
+use alloy::transports::http::reqwest::Client as AlloyHttpClient;
 use anyhow::Result;
 
 use super::chain;
@@ -9,12 +10,13 @@ use super::wallet::User;
 
 pub async fn transfer_tokens(
     config: &Config,
+    rpc_client: AlloyHttpClient,
     from: &User,
     to: Address,
     token_address: Address,
     amount: U256,
 ) -> Result<()> {
-    let provider = chain::provider(&config.rpc_url, from.signer.clone());
+    let provider = chain::provider(&config.rpc_url, rpc_client, from.signer.clone());
     let token = MockToken::new(token_address, &provider);
     token.transfer(to, amount).send().await?.watch().await?;
     Ok(())
@@ -23,6 +25,7 @@ pub async fn transfer_tokens(
 pub async fn withdraw_all_from_vault<P: Provider>(
     reader: &P,
     config: &Config,
+    rpc_client: AlloyHttpClient,
     user: &User,
     vault_address: Address,
 ) -> Result<U256> {
@@ -32,7 +35,7 @@ pub async fn withdraw_all_from_vault<P: Provider>(
         return Ok(U256::ZERO);
     }
 
-    let provider = chain::provider(&config.rpc_url, user.signer.clone());
+    let provider = chain::provider(&config.rpc_url, rpc_client, user.signer.clone());
     let vault = Vault::new(vault_address, &provider);
     vault.withdraw(balance).send().await?.watch().await?;
     Ok(balance)

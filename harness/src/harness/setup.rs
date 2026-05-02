@@ -2,6 +2,7 @@ use alloy::network::TransactionBuilder;
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::TransactionRequest;
+use alloy::transports::http::reqwest::Client as AlloyHttpClient;
 use anyhow::Result;
 use futures::stream::{self, StreamExt};
 
@@ -15,7 +16,7 @@ const ETH_PER_USER: u128 = 1_000_000_000_000_000_000;
 const TOKENS_PER_USER: u128 = 1_000_000_000_000_000_000_000_000;
 const BATCH_SIZE: usize = 50;
 
-pub async fn run(config: &Config) -> Result<Vec<User>> {
+pub async fn run(config: &Config, rpc_client: AlloyHttpClient) -> Result<Vec<User>> {
     let deployer = wallet::parse(&config.deployer_key);
     let token_addr: Address = config.token_address.parse()?;
     let vault_addr: Address = config.vault_address.parse()?;
@@ -23,19 +24,20 @@ pub async fn run(config: &Config) -> Result<Vec<User>> {
     let users = wallet::generate(USER_COUNT);
     println!("Generated {USER_COUNT} user keypairs");
 
-    fund_eth(config, deployer.clone(), &users).await?;
-    mint_tokens(config, deployer, token_addr, &users).await?;
-    approve_vault(config, token_addr, vault_addr, &users).await?;
+    fund_eth(config, rpc_client.clone(), deployer.clone(), &users).await?;
+    mint_tokens(config, rpc_client.clone(), deployer, token_addr, &users).await?;
+    approve_vault(config, rpc_client, token_addr, vault_addr, &users).await?;
 
     Ok(users)
 }
 
 async fn fund_eth(
     config: &Config,
+    rpc_client: AlloyHttpClient,
     deployer: alloy::signers::local::PrivateKeySigner,
     users: &[User],
 ) -> Result<()> {
-    let provider = chain::provider(&config.rpc_url, deployer);
+    let provider = chain::provider(&config.rpc_url, rpc_client, deployer);
     let value = U256::from(ETH_PER_USER);
 
     for chunk in users.chunks(BATCH_SIZE) {
@@ -57,11 +59,12 @@ async fn fund_eth(
 
 async fn mint_tokens(
     config: &Config,
+    rpc_client: AlloyHttpClient,
     deployer: alloy::signers::local::PrivateKeySigner,
     token_addr: Address,
     users: &[User],
 ) -> Result<()> {
-    let provider = chain::provider(&config.rpc_url, deployer);
+    let provider = chain::provider(&config.rpc_url, rpc_client, deployer);
     let token = MockToken::new(token_addr, &provider);
     let amount = U256::from(TOKENS_PER_USER);
 
@@ -75,12 +78,17 @@ async fn mint_tokens(
         }
     }
 
-    println!("Minted {} tokens to {} users", TOKENS_PER_USER / 10u128.pow(18), users.len());
+    println!(
+        "Minted {} tokens to {} users",
+        TOKENS_PER_USER / 10u128.pow(18),
+        users.len()
+    );
     Ok(())
 }
 
 async fn approve_vault(
     config: &Config,
+    rpc_client: AlloyHttpClient,
     token_addr: Address,
     vault_addr: Address,
     users: &[User],
@@ -90,9 +98,10 @@ async fn approve_vault(
     stream::iter(users)
         .map(|user| {
             let rpc_url = config.rpc_url.clone();
+            let rpc_client = rpc_client.clone();
             let signer = user.signer.clone();
             async move {
-                let provider = chain::provider(&rpc_url, signer);
+                let provider = chain::provider(&rpc_url, rpc_client, signer);
                 let token = MockToken::new(token_addr, &provider);
                 token.approve(vault_addr, max).send().await?.watch().await?;
                 Ok::<_, anyhow::Error>(())

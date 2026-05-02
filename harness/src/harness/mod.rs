@@ -8,3 +8,9 @@ pub mod order_loop;
 pub mod price;
 pub mod setup;
 pub mod wallet;
+
+#[derive(Clone)]
+pub struct HarnessClients {
+    pub service: reqwest::Client,
+    pub rpc: alloy::transports::http::reqwest::Client,
+}
