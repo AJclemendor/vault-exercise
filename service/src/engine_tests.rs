@@ -178,7 +178,12 @@ fn settlement_success_uses_refreshed_chain_balances_and_counts_matched_orders_on
     assert_eq!(seller_balance.vault, wad(10));
     assert_eq!(seller_balance.reserved, U256::ZERO);
     assert_eq!(engine.stats.orders_matched, 2);
+    assert_eq!(engine.stats.order_sides_filled, 2);
     assert_eq!(engine.stats.successful_settlements, 1);
+    let snapshot = engine.stats_snapshot();
+    assert_eq!(snapshot.orders_with_successful_fill, 2);
+    assert_eq!(snapshot.order_sides_filled, 2);
+    assert_eq!(snapshot.fills_settled, 1);
 }
 
 #[test]
@@ -233,7 +238,74 @@ fn repeated_partial_fills_do_not_double_count_the_same_matched_order() {
     engine.apply_settlement_success(&second_fill);
 
     assert_eq!(engine.stats.orders_matched, 3);
+    assert_eq!(engine.stats.order_sides_filled, 4);
     assert_eq!(engine.stats.successful_settlements, 2);
+    let snapshot = engine.stats_snapshot();
+    assert_eq!(snapshot.orders_with_successful_fill, 3);
+    assert_eq!(snapshot.fills_settled, 2);
+}
+
+#[test]
+fn rejection_stats_are_split_by_reason() {
+    let mut engine = Engine::new();
+    let buyer = address(1);
+    engine.apply_balance_refresh(buyer, wad(5), U256::ZERO);
+
+    let bad_request = engine.submit_order(SubmitOrderRequest {
+        user: buyer,
+        side: Side::Buy,
+        order_type: OrderType::Limit,
+        price: wad(1),
+        size: U256::ZERO,
+    });
+    assert!(matches!(bad_request, Err(ApiError::BadRequest(_))));
+
+    let insufficient = engine.submit_order(SubmitOrderRequest {
+        user: buyer,
+        side: Side::Buy,
+        order_type: OrderType::Limit,
+        price: wad(1),
+        size: wad(10),
+    });
+    assert!(matches!(insufficient, Err(ApiError::BadRequest(_))));
+
+    let stale_user = address(2);
+    let stale_cache = engine.submit_order(SubmitOrderRequest {
+        user: stale_user,
+        side: Side::Sell,
+        order_type: OrderType::Limit,
+        price: wad(1),
+        size: wad(1),
+    });
+    assert!(matches!(stale_cache, Err(ApiError::Chain(_))));
+
+    engine.record_admission_refresh_failed();
+    let snapshot = engine.stats_snapshot();
+    assert_eq!(snapshot.orders_received, 4);
+    assert_eq!(snapshot.orders_rejected, 4);
+    assert_eq!(snapshot.orders_rejected_bad_request, 1);
+    assert_eq!(snapshot.orders_rejected_insufficient_balance, 1);
+    assert_eq!(snapshot.orders_rejected_stale_balance_cache, 1);
+    assert_eq!(snapshot.orders_failed_balance_refresh, 1);
+}
+
+#[test]
+fn settlement_failure_stats_are_split_by_failure_class() {
+    let mut engine = Engine::new();
+    engine.record_settlement_tx_attempt();
+    engine.record_settlement_send_failed();
+    engine.record_settlement_tx_attempt();
+    engine.record_settlement_receipt_failed();
+    engine.record_settlement_tx_attempt();
+    engine.record_settlement_reverted();
+
+    let snapshot = engine.stats_snapshot();
+    assert_eq!(snapshot.settlement_tx_attempts, 3);
+    assert_eq!(snapshot.settlement_send_failures, 1);
+    assert_eq!(snapshot.settlement_receipt_failures, 1);
+    assert_eq!(snapshot.settlements_reverted, 1);
+    assert_eq!(snapshot.settlement_receipt_reverts, 1);
+    assert_eq!(snapshot.settlements_reverted_pct, 100.0 / 3.0);
 }
 
 #[test]
@@ -336,80 +408,6 @@ fn fill_candidates_receive_monotonic_sequence_numbers() {
 
     assert_eq!(first_fill.seq, 1);
     assert_eq!(second_fill.seq, 2);
-}
-
-#[test]
-fn priority_revalidation_releases_fill_when_better_order_arrives() {
-    let mut engine = Engine::new();
-    let buyer_one = address(1);
-    let seller_one = address(2);
-    let buyer_two = address(3);
-    let seller_two = address(4);
-    let better_buyer = address(5);
-    engine.apply_balance_refresh(buyer_one, wad(20), U256::ZERO);
-    engine.apply_balance_refresh(seller_one, wad(20), U256::ZERO);
-    engine.apply_balance_refresh(buyer_two, wad(20), U256::ZERO);
-    engine.apply_balance_refresh(seller_two, wad(20), U256::ZERO);
-    engine.apply_balance_refresh(better_buyer, wad(40), U256::ZERO);
-
-    submit(
-        &mut engine,
-        buyer_one,
-        Side::Buy,
-        OrderType::Limit,
-        wad(1),
-        wad(10),
-    );
-    submit(
-        &mut engine,
-        seller_one,
-        Side::Sell,
-        OrderType::Limit,
-        wad(1),
-        wad(10),
-    );
-    submit(
-        &mut engine,
-        buyer_two,
-        Side::Buy,
-        OrderType::Limit,
-        wad(1),
-        wad(10),
-    );
-    submit(
-        &mut engine,
-        seller_two,
-        Side::Sell,
-        OrderType::Limit,
-        wad(1),
-        wad(10),
-    );
-
-    let _first_fill = engine
-        .next_fill_candidate()
-        .expect("first pair should cross");
-    let second_fill = engine
-        .next_fill_candidate()
-        .expect("second pair should cross");
-    assert!(engine.fill_matches_current_priority(&second_fill));
-
-    let better_buy_id = submit(
-        &mut engine,
-        better_buyer,
-        Side::Buy,
-        OrderType::Limit,
-        wad(2),
-        wad(10),
-    );
-
-    assert!(!engine.fill_matches_current_priority(&second_fill));
-
-    engine.abort_fill(&second_fill, false, false);
-    let reprioritized_fill = engine
-        .next_fill_candidate()
-        .expect("better buy should now cross released sell");
-    assert_eq!(reprioritized_fill.buy_id, better_buy_id);
-    assert_eq!(reprioritized_fill.sell_id, second_fill.sell_id);
 }
 
 #[test]

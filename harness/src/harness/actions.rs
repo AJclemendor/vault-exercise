@@ -9,13 +9,12 @@ use super::wallet::User;
 
 pub async fn transfer_tokens(
     config: &Config,
-    client: &reqwest::Client,
     from: &User,
     to: Address,
     token_address: Address,
     amount: U256,
 ) -> Result<()> {
-    let provider = chain::provider(&config.rpc_url, client.clone(), from.signer.clone());
+    let provider = chain::provider(&config.rpc_url, from.signer.clone());
     let token = MockToken::new(token_address, &provider);
     token.transfer(to, amount).send().await?.watch().await?;
     Ok(())
@@ -24,7 +23,6 @@ pub async fn transfer_tokens(
 pub async fn withdraw_all_from_vault<P: Provider>(
     reader: &P,
     config: &Config,
-    client: &reqwest::Client,
     user: &User,
     vault_address: Address,
 ) -> Result<U256> {
@@ -34,7 +32,7 @@ pub async fn withdraw_all_from_vault<P: Provider>(
         return Ok(U256::ZERO);
     }
 
-    let provider = chain::provider(&config.rpc_url, client.clone(), user.signer.clone());
+    let provider = chain::provider(&config.rpc_url, user.signer.clone());
     let vault = Vault::new(vault_address, &provider);
     vault.withdraw(balance).send().await?.watch().await?;
     Ok(balance)

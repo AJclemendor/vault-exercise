@@ -15,20 +15,21 @@ const MASTER_SEED: u64 = 42;
 async fn main() -> anyhow::Result<()> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let config = Arc::new(Config::load(&root.join("config/local.json")));
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()?;
-    let users = harness::setup::run(&config, client.clone()).await?;
+    let users = harness::setup::run(&config).await?;
     println!("Setup complete: {} users funded and approved", users.len());
 
     let token_address: Address = config.token_address.parse()?;
     let vault_address: Address = config.vault_address.parse()?;
-    let reader = harness::chain::reader(&config.rpc_url, client.clone());
+    let reader = harness::chain::reader(&config.rpc_url);
 
     let fair = FairPrice::new();
     let cancel = CancellationToken::new();
 
     harness::price::spawn(fair.clone(), cancel.clone());
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
 
     let _order_handles = harness::order_loop::spawn_all(
         &users,
@@ -37,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
         token_address,
         fair.clone(),
         cancel.clone(),
-        client.clone(),
+        client,
         MASTER_SEED,
     );
 
@@ -48,7 +49,6 @@ async fn main() -> anyhow::Result<()> {
         token_address,
         vault_address,
         cancel.clone(),
-        client,
         MASTER_SEED,
     );
 

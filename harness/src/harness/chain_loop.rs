@@ -1,8 +1,8 @@
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
+use rand::rngs::SmallRng;
 use rand::Rng;
 use rand::SeedableRng;
-use rand::rngs::SmallRng;
 use std::sync::Arc;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -18,7 +18,6 @@ pub fn spawn_all<P: Provider + Clone + Send + Sync + 'static>(
     token_address: Address,
     vault_address: Address,
     cancel: CancellationToken,
-    client: reqwest::Client,
     master_seed: u64,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let all_addresses: Vec<Address> = users.iter().map(|u| u.address).collect();
@@ -32,19 +31,9 @@ pub fn spawn_all<P: Provider + Clone + Send + Sync + 'static>(
             let config = config.clone();
             let reader = reader.clone();
             let cancel = cancel.clone();
-            let client = client.clone();
             let peers = all_addresses.clone();
             tokio::spawn(run_one(
-                i,
-                address,
-                signer,
-                config,
-                reader,
-                token_address,
-                vault_address,
-                cancel,
-                client,
-                peers,
+                i, address, signer, config, reader, token_address, vault_address, cancel, peers,
                 master_seed,
             ))
         })
@@ -60,12 +49,10 @@ async fn run_one<P: Provider>(
     token_address: Address,
     vault_address: Address,
     cancel: CancellationToken,
-    client: reqwest::Client,
     peers: Vec<Address>,
     master_seed: u64,
 ) {
-    let mut rng =
-        SmallRng::seed_from_u64(master_seed.wrapping_add(index as u64).wrapping_add(10_000));
+    let mut rng = SmallRng::seed_from_u64(master_seed.wrapping_add(index as u64).wrapping_add(10_000));
     let user = User { address, signer };
 
     loop {
@@ -75,8 +62,7 @@ async fn run_one<P: Provider>(
             _ = tokio::time::sleep(Duration::from_millis(sleep_ms)) => {}
         }
 
-        let vault_balance = match actions::get_vault_balance(&reader, vault_address, address).await
-        {
+        let vault_balance = match actions::get_vault_balance(&reader, vault_address, address).await {
             Ok(b) => b,
             Err(e) => {
                 println!("[chain] user={} vault balance query failed: {e}", address);
@@ -85,9 +71,7 @@ async fn run_one<P: Provider>(
         };
 
         if !vault_balance.is_zero() {
-            match actions::withdraw_all_from_vault(&reader, &config, &client, &user, vault_address)
-                .await
-            {
+            match actions::withdraw_all_from_vault(&reader, &config, &user, vault_address).await {
                 Ok(amount) => {
                     if !amount.is_zero() {
                         println!("[chain] user={} withdraw_all amount={}", address, amount);
@@ -117,16 +101,7 @@ async fn run_one<P: Provider>(
                 let pct = rng.random_range(10u64..=40u64);
                 let amount = eoa * U256::from(pct) / U256::from(100u64);
                 if !amount.is_zero() {
-                    match actions::transfer_tokens(
-                        &config,
-                        &client,
-                        &user,
-                        target,
-                        token_address,
-                        amount,
-                    )
-                    .await
-                    {
+                    match actions::transfer_tokens(&config, &user, target, token_address, amount).await {
                         Ok(()) => {
                             println!(
                                 "[chain] user={} transfer_to_peer target={} amount={}",

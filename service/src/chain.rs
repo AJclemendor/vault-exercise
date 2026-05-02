@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::time::Duration;
+use thiserror::Error;
 
 sol! {
     #[sol(rpc)]
@@ -134,13 +135,12 @@ impl ChainClient {
     pub(crate) async fn confirm_settlement(
         &self,
         pending: PendingTransactionBuilder<Ethereum>,
-    ) -> Result<()> {
-        let receipt = pending
-            .get_receipt()
-            .await
-            .context("matchOrders receipt failed")?;
+    ) -> std::result::Result<(), SettlementConfirmationError> {
+        let receipt = pending.get_receipt().await.map_err(|err| {
+            SettlementConfirmationError::Receipt(anyhow!(err).context("matchOrders receipt failed"))
+        })?;
         if !receipt.status() {
-            return Err(anyhow!("matchOrders transaction reverted"));
+            return Err(SettlementConfirmationError::Reverted);
         }
         Ok(())
     }
@@ -258,6 +258,14 @@ impl ChainClient {
         }
         Ok(values)
     }
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum SettlementConfirmationError {
+    #[error("matchOrders receipt failed: {0:#}")]
+    Receipt(#[source] anyhow::Error),
+    #[error("matchOrders transaction reverted")]
+    Reverted,
 }
 
 #[derive(Serialize)]

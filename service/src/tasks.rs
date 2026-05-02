@@ -1,118 +1,19 @@
 use crate::AppState;
-use crate::engine::FillCandidate;
+use crate::chain::SettlementConfirmationError;
+use crate::engine::{Engine, FillCandidate};
 use anyhow::Result;
-use std::collections::BTreeSet;
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, Notify, Semaphore};
 
 const ACTIVE_REFRESH_INTERVAL: Duration = Duration::from_millis(300);
 const LOG_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const MATCH_IDLE_SLEEP: Duration = Duration::from_millis(25);
 const STATS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const ACTIVE_REFRESH_BUDGET: usize = 40;
-const SETTLEMENT_CONCURRENCY: usize = 16;
 const BAR_WIDTH: usize = 24;
 
-#[derive(Debug, Clone, Copy)]
-enum SettlementMode {
-    Sequential,
-    Concurrent,
-}
-
-impl SettlementMode {
-    fn from_env() -> Self {
-        match std::env::var("SETTLEMENT_MODE") {
-            Ok(value) if value.eq_ignore_ascii_case("sequential") => Self::Sequential,
-            Ok(value) if value.eq_ignore_ascii_case("concurrent") => Self::Concurrent,
-            Ok(value) => {
-                eprintln!(
-                    "[config] unknown SETTLEMENT_MODE={value:?}; using concurrent settlement"
-                );
-                Self::Concurrent
-            }
-            Err(_) => Self::Concurrent,
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Sequential => "sequential",
-            Self::Concurrent => "concurrent",
-        }
-    }
-}
-
-#[derive(Debug)]
-struct SettlementSequencer {
-    state: Mutex<SettlementSequenceState>,
-    notify: Notify,
-}
-
-#[derive(Debug)]
-struct SettlementSequenceState {
-    next_to_submit: u64,
-    completed: BTreeSet<u64>,
-}
-
-impl SettlementSequencer {
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(SettlementSequenceState {
-                next_to_submit: 1,
-                completed: BTreeSet::new(),
-            }),
-            notify: Notify::new(),
-        }
-    }
-
-    async fn wait_for_turn(&self, seq: u64) {
-        loop {
-            let notified = self.notify.notified();
-            {
-                let state = self.state.lock().await;
-                if seq <= state.next_to_submit {
-                    return;
-                }
-            }
-            notified.await;
-        }
-    }
-
-    async fn complete(&self, seq: u64) {
-        let mut state = self.state.lock().await;
-        if seq >= state.next_to_submit {
-            state.completed.insert(seq);
-            loop {
-                let next = state.next_to_submit;
-                if !state.completed.remove(&next) {
-                    break;
-                }
-                state.next_to_submit = next + 1;
-            }
-        }
-        drop(state);
-        self.notify.notify_waiters();
-    }
-}
-
 pub(crate) async fn settlement_loop(state: AppState) {
-    match SettlementMode::from_env() {
-        SettlementMode::Sequential => {
-            println!(
-                "[config] settlement_mode={} settlement_concurrency=1",
-                SettlementMode::Sequential.as_str()
-            );
-            sequential_settlement_loop(state).await;
-        }
-        SettlementMode::Concurrent => {
-            println!(
-                "[config] settlement_mode={} settlement_concurrency={SETTLEMENT_CONCURRENCY}",
-                SettlementMode::Concurrent.as_str()
-            );
-            concurrent_settlement_loop(state).await;
-        }
-    }
+    println!("[config] settlement_mode=sequential settlement_concurrency=1");
+    sequential_settlement_loop(state).await;
 }
 
 async fn sequential_settlement_loop(state: AppState) {
@@ -126,40 +27,11 @@ async fn sequential_settlement_loop(state: AppState) {
             continue;
         };
 
-        process_fill_sequential(&state, &fill).await;
+        process_fill(&state, &fill).await;
     }
 }
 
-async fn concurrent_settlement_loop(state: AppState) {
-    let settlement_permits = Arc::new(Semaphore::new(SETTLEMENT_CONCURRENCY));
-    let settlement_sequence = Arc::new(SettlementSequencer::new());
-
-    loop {
-        let permit = settlement_permits
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("settlement semaphore is not closed");
-        let fill = {
-            let mut engine = state.engine.lock().await;
-            engine.next_fill_candidate()
-        };
-        let Some(fill) = fill else {
-            drop(permit);
-            tokio::time::sleep(MATCH_IDLE_SLEEP).await;
-            continue;
-        };
-
-        let state = state.clone();
-        let settlement_sequence = settlement_sequence.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            process_fill(state, fill, settlement_sequence).await;
-        });
-    }
-}
-
-async fn process_fill_sequential(state: &AppState, fill: &FillCandidate) {
+async fn process_fill(state: &AppState, fill: &FillCandidate) {
     if let Err(err) = refresh_for_settlement(state, fill).await {
         eprintln!(
             "[settlement] refresh failed seq={} buy={} sell={} price={} size={}: {err:#}",
@@ -210,7 +82,7 @@ async fn process_fill_sequential(state: &AppState, fill: &FillCandidate) {
                 let result = state.chain.confirm_settlement(pending).await;
                 if let Err(err) = result {
                     eprintln!(
-                        "[settlement] matchOrders reverted seq={} attempt={} buy={} sell={} quote={} base={}: {err:#}",
+                        "[settlement] matchOrders confirmation failed seq={} attempt={} buy={} sell={} quote={} base={}: {err:#}",
                         fill.seq,
                         attempt + 1,
                         fill.buyer,
@@ -219,12 +91,12 @@ async fn process_fill_sequential(state: &AppState, fill: &FillCandidate) {
                         fill.base
                     );
 
-                    let funded_after_revert = refresh_after_revert(state, fill).await;
+                    let funded_after_failure = refresh_after_failed_settlement(state, fill).await;
                     let mut engine = state.engine.lock().await;
-                    engine.record_settlement_reverted();
+                    record_settlement_confirmation_failure(&mut engine, &err);
 
                     if attempt == 0
-                        && funded_after_revert.unwrap_or(false)
+                        && funded_after_failure.unwrap_or(false)
                         && engine.fill_still_pending(fill)
                     {
                         continue;
@@ -259,160 +131,12 @@ async fn process_fill_sequential(state: &AppState, fill: &FillCandidate) {
                     fill.base
                 );
 
-                let funded_after_revert = refresh_after_revert(state, fill).await;
+                let funded_after_failure = refresh_after_failed_settlement(state, fill).await;
                 let mut engine = state.engine.lock().await;
-                engine.record_settlement_reverted();
+                engine.record_settlement_send_failed();
 
                 if attempt == 0
-                    && funded_after_revert.unwrap_or(false)
-                    && engine.fill_still_pending(fill)
-                {
-                    continue;
-                }
-
-                let (buyer_ok, seller_ok) = engine.prune_underfunded_fill_users(fill);
-                engine.abort_fill(fill, !buyer_ok, !seller_ok);
-                return;
-            }
-        }
-    }
-}
-
-async fn process_fill(
-    state: AppState,
-    fill: FillCandidate,
-    settlement_sequence: Arc<SettlementSequencer>,
-) {
-    process_fill_inner(&state, &fill, &settlement_sequence).await;
-    settlement_sequence.complete(fill.seq).await;
-}
-
-async fn process_fill_inner(
-    state: &AppState,
-    fill: &FillCandidate,
-    settlement_sequence: &SettlementSequencer,
-) {
-    if let Err(err) = refresh_for_settlement(state, fill).await {
-        eprintln!(
-            "[settlement] refresh failed seq={} buy={} sell={} price={} size={}: {err:#}",
-            fill.seq, fill.buyer, fill.seller, fill.exec_price, fill.fill_size
-        );
-        let mut engine = state.engine.lock().await;
-        engine.mark_dirty(fill.buyer);
-        engine.mark_dirty(fill.seller);
-        engine.abort_fill(fill, false, false);
-        return;
-    }
-
-    {
-        let engine = state.engine.lock().await;
-        if !engine.fill_still_pending(fill) {
-            return;
-        }
-    }
-
-    settlement_sequence.wait_for_turn(fill.seq).await;
-
-    let mut settlement_attempt_recorded = false;
-    for attempt in 0..=1 {
-        if let Err(err) = refresh_for_settlement(state, fill).await {
-            eprintln!(
-                "[settlement] pre-submit refresh failed seq={} buy={} sell={} price={} size={}: {err:#}",
-                fill.seq, fill.buyer, fill.seller, fill.exec_price, fill.fill_size
-            );
-            let mut engine = state.engine.lock().await;
-            engine.mark_dirty(fill.buyer);
-            engine.mark_dirty(fill.seller);
-            engine.abort_fill(fill, false, false);
-            return;
-        }
-
-        {
-            let mut engine = state.engine.lock().await;
-            if !engine.fill_still_pending(fill) {
-                return;
-            }
-            if !engine.fill_matches_current_priority(fill) {
-                engine.abort_fill(fill, false, false);
-                return;
-            }
-            if !settlement_attempt_recorded {
-                engine.record_settlement_attempted();
-                settlement_attempt_recorded = true;
-            }
-            let (buyer_ok, seller_ok) = engine.prune_underfunded_fill_users(fill);
-            if !buyer_ok || !seller_ok {
-                engine.record_settlement_precheck_failed();
-                engine.abort_fill(fill, !buyer_ok, !seller_ok);
-                return;
-            }
-            engine.record_settlement_tx_attempt();
-        }
-
-        match state
-            .chain
-            .submit_settlement(fill.buyer, fill.seller, fill.quote, fill.base)
-            .await
-        {
-            Ok(pending) => {
-                // Once RPC accepts the tx, the operator nonce fixes chain order.
-                // Receipt polling can continue without blocking later ordered submits.
-                settlement_sequence.complete(fill.seq).await;
-                let result = state.chain.confirm_settlement(pending).await;
-                if let Err(err) = result {
-                    eprintln!(
-                        "[settlement] matchOrders reverted seq={} attempt={} buy={} sell={} quote={} base={}: {err:#}",
-                        fill.seq,
-                        attempt + 1,
-                        fill.buyer,
-                        fill.seller,
-                        fill.quote,
-                        fill.base
-                    );
-
-                    let funded_after_revert = refresh_after_revert(state, fill).await;
-                    let mut engine = state.engine.lock().await;
-                    engine.record_settlement_reverted();
-
-                    let (buyer_ok, seller_ok) = if funded_after_revert.unwrap_or(false) {
-                        engine.users_funded_for_reserved(fill)
-                    } else {
-                        engine.prune_underfunded_fill_users(fill)
-                    };
-                    engine.abort_fill(fill, !buyer_ok, !seller_ok);
-                    return;
-                }
-
-                if let Err(err) = refresh_after_success(state, fill).await {
-                    eprintln!(
-                        "[settlement] post-success refresh failed seq={} buy={} sell={} quote={} base={}: {err:#}",
-                        fill.seq, fill.buyer, fill.seller, fill.quote, fill.base
-                    );
-                    let mut engine = state.engine.lock().await;
-                    engine.mark_dirty(fill.buyer);
-                    engine.mark_dirty(fill.seller);
-                }
-                let mut engine = state.engine.lock().await;
-                engine.apply_settlement_success(fill);
-                return;
-            }
-            Err(err) => {
-                eprintln!(
-                    "[settlement] matchOrders send failed seq={} attempt={} buy={} sell={} quote={} base={}: {err:#}",
-                    fill.seq,
-                    attempt + 1,
-                    fill.buyer,
-                    fill.seller,
-                    fill.quote,
-                    fill.base
-                );
-
-                let funded_after_revert = refresh_after_revert(state, fill).await;
-                let mut engine = state.engine.lock().await;
-                engine.record_settlement_reverted();
-
-                if attempt == 0
-                    && funded_after_revert.unwrap_or(false)
+                    && funded_after_failure.unwrap_or(false)
                     && engine.fill_still_pending(fill)
                 {
                     continue;
@@ -447,11 +171,18 @@ async fn refresh_for_settlement(state: &AppState, fill: &FillCandidate) -> Resul
     Ok(())
 }
 
-async fn refresh_after_revert(state: &AppState, fill: &FillCandidate) -> Result<bool> {
+async fn refresh_after_failed_settlement(state: &AppState, fill: &FillCandidate) -> Result<bool> {
     refresh_for_settlement(state, fill).await?;
     let engine = state.engine.lock().await;
     let (buyer_ok, seller_ok) = engine.users_funded_for_reserved(fill);
     Ok(buyer_ok && seller_ok)
+}
+
+fn record_settlement_confirmation_failure(engine: &mut Engine, err: &SettlementConfirmationError) {
+    match err {
+        SettlementConfirmationError::Reverted => engine.record_settlement_reverted(),
+        SettlementConfirmationError::Receipt(_) => engine.record_settlement_receipt_failed(),
+    }
 }
 
 async fn refresh_after_success(state: &AppState, fill: &FillCandidate) -> Result<()> {
@@ -553,11 +284,14 @@ pub(crate) async fn stats_log_loop(state: AppState) {
                 "    received   {:>8}\n",
                 "    accepted   {:>8} {:>6.1}% {}\n",
                 "    rejected   {:>8} {:>6.1}% {}\n",
-                "    matched    {:>8} {:>6.1}% of accepted {}\n",
+                "      bad_req   {:>8} insuff={:>8} stale_cache={:>8} refresh_fail={:>8}\n",
+                "    matched    {:>8} {:>6.1}% of accepted {} (unique orders touched)\n",
+                "    fill_sides {:>8}\n",
                 "    open       {:>8} {:>6.1}% of accepted {}\n",
                 "  settlements\n",
                 "    attempted  {:>8}\n",
                 "    reverted   {:>8} {:>6.1}% of tx attempts {}\n",
+                "    send_fail  {:>8} receipt_fail={:>8}\n",
                 "  diagnostics\n",
                 "    fill_candidates {:>8} {:>6.1}% of accepted {}\n",
                 "    ok              {:>8} {:>6.1}% of attempted, {:>6.1}% of candidates\n",
@@ -573,9 +307,14 @@ pub(crate) async fn stats_log_loop(state: AppState) {
             snapshot.orders_rejected,
             snapshot.orders_rejected_pct,
             pct_bar(snapshot.orders_rejected_pct),
+            snapshot.orders_rejected_bad_request,
+            snapshot.orders_rejected_insufficient_balance,
+            snapshot.orders_rejected_stale_balance_cache,
+            snapshot.orders_failed_balance_refresh,
             snapshot.orders_matched,
             snapshot.orders_matched_pct_of_accepted,
             pct_bar(snapshot.orders_matched_pct_of_accepted),
+            snapshot.order_sides_filled,
             snapshot.currently_open_orders,
             snapshot.currently_open_orders_pct_of_accepted,
             pct_bar(snapshot.currently_open_orders_pct_of_accepted),
@@ -583,6 +322,8 @@ pub(crate) async fn stats_log_loop(state: AppState) {
             snapshot.settlements_reverted,
             snapshot.settlements_reverted_pct,
             pct_bar(snapshot.settlements_reverted_pct),
+            snapshot.settlement_send_failures,
+            snapshot.settlement_receipt_failures,
             snapshot.fill_candidates,
             fill_candidates_pct_of_accepted,
             pct_bar(fill_candidates_pct_of_accepted),

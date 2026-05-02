@@ -1,36 +1,18 @@
 use super::*;
-use tokio::time::timeout;
 
-#[tokio::test]
-async fn settlement_sequencer_advances_through_out_of_order_completions() {
-    let sequencer = Arc::new(SettlementSequencer::new());
+#[test]
+fn confirmation_failures_keep_receipt_errors_separate_from_reverts() {
+    let mut engine = Engine::new();
 
-    timeout(Duration::from_millis(10), sequencer.wait_for_turn(1))
-        .await
-        .expect("first sequence should be immediately available");
+    record_settlement_confirmation_failure(&mut engine, &SettlementConfirmationError::Reverted);
+    record_settlement_confirmation_failure(
+        &mut engine,
+        &SettlementConfirmationError::Receipt(anyhow::anyhow!("receipt rpc timed out")),
+    );
 
-    let waiting_for_two = {
-        let sequencer = Arc::clone(&sequencer);
-        tokio::spawn(async move {
-            sequencer.wait_for_turn(2).await;
-        })
-    };
-
-    tokio::task::yield_now().await;
-    assert!(!waiting_for_two.is_finished());
-
-    sequencer.complete(3).await;
-    tokio::task::yield_now().await;
-    assert!(!waiting_for_two.is_finished());
-
-    sequencer.complete(1).await;
-    timeout(Duration::from_millis(100), waiting_for_two)
-        .await
-        .expect("second sequence should unblock after first completes")
-        .expect("wait task should not panic");
-
-    sequencer.complete(2).await;
-    timeout(Duration::from_millis(10), sequencer.wait_for_turn(4))
-        .await
-        .expect("third completion should be replayed once second completes");
+    let snapshot = engine.stats_snapshot();
+    assert_eq!(snapshot.settlements_reverted, 1);
+    assert_eq!(snapshot.settlement_receipt_reverts, 1);
+    assert_eq!(snapshot.settlement_receipt_failures, 1);
+    assert_eq!(snapshot.settlement_send_failures, 0);
 }
