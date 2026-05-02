@@ -1,7 +1,5 @@
 # Vault Exercise
 
-## What this is
-
 This is a simplified off-chain matched, on-chain settled exchange. A `Vault` contract on a local Anvil chain acts as a settlement primitive — an operator calls `matchOrders(a, b, amountA, amountB)` to atomically swap tokens between two users. A simulation harness creates 200 users who continuously submit orders to an HTTP service and simultaneously perform chaotic on-chain activity (withdrawals, peer-to-peer transfers) that destabilize the service's view of the world.
 
 Your job is to build that HTTP service in `service/`. It maintains an order book, validates incoming orders against on-chain balances, matches crossing orders, and settles them through the vault. The architecture is entirely yours.
