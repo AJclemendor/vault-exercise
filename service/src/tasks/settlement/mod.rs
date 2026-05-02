@@ -307,6 +307,9 @@ fn spawn_concurrent_settlement_worker(args: SettlementWorkerArgs) {
             .invalidates(args.claim_generation, args.fill.seq)
         {
             let mut engine = args.state.engine.lock().await;
+            if precheck != ConcurrentPreSubmitCheck::NotPending {
+                engine.record_settlement_aborted_before_tx();
+            }
             engine.abort_fill(&args.fill, false, false);
             drop(engine);
             args.reorder_state.record_event(args.fill.seq);
@@ -366,6 +369,7 @@ async fn precheck_fill_for_concurrent_submit(
     {
         let mut engine = state.engine.lock().await;
         if !engine.fill_still_pending(fill) {
+            engine.record_settlement_aborted_before_tx();
             return ConcurrentPreSubmitCheck::NotPending;
         }
         engine.record_settlement_attempted();
@@ -379,8 +383,9 @@ async fn precheck_fill_for_concurrent_submit(
         return ConcurrentPreSubmitCheck::RefreshFailed;
     }
 
-    let engine = state.engine.lock().await;
+    let mut engine = state.engine.lock().await;
     if !engine.fill_still_pending(fill) {
+        engine.record_settlement_aborted_before_tx();
         return ConcurrentPreSubmitCheck::NotPending;
     }
     let (buyer_ok, seller_ok) = engine.users_funded_for_reserved(fill);
@@ -411,6 +416,7 @@ async fn finalize_concurrent_pre_submit(
 
     let mut engine = state.engine.lock().await;
     if !engine.fill_still_pending(fill) {
+        engine.record_settlement_aborted_before_tx();
         return PreSubmitDecision::Abort;
     }
     let (buyer_ok, seller_ok) = engine.prune_underfunded_fill_users(fill);

@@ -80,15 +80,18 @@ impl Engine {
         let fill_candidates = self.stats.fill_candidates;
         let settlement_attempts = self.stats.settlements_attempted;
         let settlement_precheck_attempts = settlement_attempts;
-        let settlement_precheck_passed = self
+        let max_precheck_passed = self
             .stats
             .settlements_attempted
             .saturating_sub(self.stats.settlements_precheck_failed);
+        let settlement_precheck_passed = self.stats.settlement_tx_attempts.min(max_precheck_passed);
         let settlement_tx_submitted = self
             .stats
             .settlement_tx_attempts
             .saturating_sub(self.stats.settlement_send_failures);
-        let settlement_terminal_outcomes = self.stats.successful_settlements + settlement_failures;
+        let settlement_terminal_outcomes = self.stats.successful_settlements
+            + settlement_failures
+            + self.stats.settlements_aborted_before_tx;
         let settlement_pending_outcomes = self
             .stats
             .fill_candidates
@@ -163,6 +166,11 @@ impl Engine {
             settlement_precheck_passed_pct: pct(
                 settlement_precheck_passed,
                 settlement_precheck_attempts,
+            ),
+            settlements_aborted_before_tx: self.stats.settlements_aborted_before_tx,
+            settlements_aborted_before_tx_pct_of_candidates: pct(
+                self.stats.settlements_aborted_before_tx,
+                fill_candidates,
             ),
             settlement_tx_attempts: self.stats.settlement_tx_attempts,
             settlement_tx_attempts_pct_of_attempted: pct(
@@ -280,6 +288,10 @@ impl Engine {
 
     pub(crate) fn record_settlement_precheck_failed(&mut self) {
         self.stats.settlements_precheck_failed += 1;
+    }
+
+    pub(crate) fn record_settlement_aborted_before_tx(&mut self) {
+        self.stats.settlements_aborted_before_tx += 1;
     }
 
     pub(crate) fn record_settlement_tx_attempt(&mut self) {

@@ -683,6 +683,47 @@ fn settlement_snapshot_reports_candidates_separately_from_attempts() {
 }
 
 #[test]
+fn settlement_abort_before_tx_is_terminal_without_passing_precheck() {
+    let mut engine = Engine::new();
+    let buyer = address(1);
+    let seller = address(2);
+    engine.apply_balance_refresh(buyer, wad(20), U256::ZERO);
+    engine.apply_balance_refresh(seller, wad(10), U256::ZERO);
+
+    submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+    submit(
+        &mut engine,
+        seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+
+    let fill = engine.next_fill_candidate().expect("orders should cross");
+    engine.record_settlement_attempted();
+    engine.abort_fill(&fill, false, false);
+    engine.record_settlement_aborted_before_tx();
+
+    let snapshot = engine.stats_snapshot();
+    assert_eq!(snapshot.fill_candidates, 1);
+    assert_eq!(snapshot.settlements_attempted, 1);
+    assert_eq!(snapshot.settlement_precheck_passed, 0);
+    assert_eq!(snapshot.settlement_tx_attempts, 0);
+    assert_eq!(snapshot.settlements_aborted_before_tx, 1);
+    assert_eq!(snapshot.settlement_failures, 0);
+    assert_eq!(snapshot.settlement_terminal_outcomes, 1);
+    assert_eq!(snapshot.settlement_pending_outcomes, 0);
+}
+
+#[test]
 fn repeated_partial_fills_do_not_double_count_the_same_matched_order() {
     let mut engine = Engine::new();
     let buyer = address(1);

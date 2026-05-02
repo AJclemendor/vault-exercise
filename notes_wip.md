@@ -5,8 +5,7 @@ Also, my eyesight is lowkey dying, so I tend to log some things with color and f
 
  ^ if you run the run.sh script you will see what I mean
 
-Here are metrics for an 8 min run
-## First Interval Run
+# Here are metrics for an 8 min run
 
 ### First Stats Snapshot
 
@@ -64,6 +63,8 @@ Here are metrics for an 8 min run
 | Open status | 569 |
 | Partial status | 10 |
 | Lifetime accepted pct | 2.6% |
+
+
 
 The harness intentionally makes 25% of submitted orders oversized at `1.5x-3x` the user’s EOA balance. But “oversized” is based on raw size, while buy admission is based on notional. So a buy with `2x` balance in size at a `0.40` price only requires `0.8x` balance and can validly pass.
 

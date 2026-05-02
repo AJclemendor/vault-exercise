@@ -35,6 +35,7 @@ pub(super) async fn prepare_fill_for_submit(
     {
         let mut engine = state.engine.lock().await;
         if !engine.fill_still_pending(fill) {
+            engine.record_settlement_aborted_before_tx();
             return PreSubmitDecision::Abort;
         }
         engine.record_settlement_attempted();
@@ -56,6 +57,7 @@ pub(super) async fn prepare_fill_for_submit(
     {
         let mut engine = state.engine.lock().await;
         if !engine.fill_still_pending(fill) {
+            engine.record_settlement_aborted_before_tx();
             return PreSubmitDecision::Abort;
         }
         let (buyer_ok, seller_ok) = engine.prune_underfunded_fill_users(fill);
