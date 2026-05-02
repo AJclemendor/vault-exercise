@@ -72,6 +72,8 @@ impl Engine {
             + self.stats.settlement_receipt_failures
             + self.stats.settlements_reverted;
         let settlement_failures = self.stats.settlements_precheck_failed + settlement_tx_failures;
+        let settlement_claims = self.stats.fill_candidates;
+        let settlement_precheck_attempts = self.stats.settlements_attempted;
         let settlement_precheck_passed = self
             .stats
             .settlements_attempted
@@ -138,7 +140,7 @@ impl Engine {
             fill_candidates: self.stats.fill_candidates,
             fill_candidates_pct_of_settlements_attempted: pct(
                 self.stats.fill_candidates,
-                self.stats.settlements_attempted,
+                settlement_claims,
             ),
             orders_matched_pct_of_accepted: pct(
                 self.stats.unique_orders_with_successful_fill,
@@ -148,17 +150,25 @@ impl Engine {
                 self.stats.unique_orders_with_successful_fill,
                 self.stats.orders_accepted,
             ),
-            settlements_attempted: self.stats.settlements_attempted,
-            settlement_precheck_attempts: self.stats.settlements_attempted,
+            settlements_attempted: settlement_claims,
+            settlement_precheck_attempts,
+            settlement_precheck_attempts_pct_of_candidates: pct(
+                settlement_precheck_attempts,
+                settlement_claims,
+            ),
             settlement_precheck_passed,
             settlement_precheck_passed_pct: pct(
                 settlement_precheck_passed,
-                self.stats.settlements_attempted,
+                settlement_precheck_attempts,
             ),
             settlement_tx_attempts: self.stats.settlement_tx_attempts,
             settlement_tx_attempts_pct_of_attempted: pct(
                 self.stats.settlement_tx_attempts,
-                self.stats.settlements_attempted,
+                settlement_claims,
+            ),
+            settlement_tx_attempts_pct_of_precheck_passed: pct(
+                self.stats.settlement_tx_attempts,
+                settlement_precheck_passed,
             ),
             settlement_tx_submitted,
             settlement_tx_submitted_pct_of_attempts: pct(
@@ -166,7 +176,7 @@ impl Engine {
                 self.stats.settlement_tx_attempts,
             ),
             settlement_failures,
-            settlement_failures_pct: pct(settlement_failures, self.stats.settlements_attempted),
+            settlement_failures_pct: pct(settlement_failures, settlement_claims),
             settlement_tx_failures,
             settlement_tx_failures_pct: pct(
                 settlement_tx_failures,
@@ -176,7 +186,7 @@ impl Engine {
             settlement_precheck_failures: self.stats.settlements_precheck_failed,
             settlements_precheck_failed_pct: pct(
                 self.stats.settlements_precheck_failed,
-                self.stats.settlements_attempted,
+                settlement_precheck_attempts,
             ),
             settlement_send_failures: self.stats.settlement_send_failures,
             settlement_send_failures_pct: pct(

@@ -330,6 +330,41 @@ fn settlement_success_uses_refreshed_chain_balances_and_counts_matched_orders_on
 }
 
 #[test]
+fn settlement_snapshot_does_not_exceed_candidate_denominator_before_precheck() {
+    let mut engine = Engine::new();
+    let buyer = address(1);
+    let seller = address(2);
+    engine.apply_balance_refresh(buyer, wad(20), U256::ZERO);
+    engine.apply_balance_refresh(seller, wad(10), U256::ZERO);
+
+    submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+    submit(
+        &mut engine,
+        seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+
+    let _fill = engine.next_fill_candidate().expect("orders should cross");
+    let snapshot = engine.stats_snapshot();
+
+    assert_eq!(snapshot.fill_candidates, 1);
+    assert_eq!(snapshot.settlements_attempted, 1);
+    assert_eq!(snapshot.fill_candidates_pct_of_settlements_attempted, 100.0);
+    assert_eq!(snapshot.settlement_precheck_attempts, 0);
+    assert_eq!(snapshot.settlement_precheck_attempts_pct_of_candidates, 0.0);
+}
+
+#[test]
 fn repeated_partial_fills_do_not_double_count_the_same_matched_order() {
     let mut engine = Engine::new();
     let buyer = address(1);
