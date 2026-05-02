@@ -157,13 +157,16 @@ Remaining tradeoffs: resting limit orders can overbook balance, which improves l
 
 In production, I would persist orders, reservations, fills, submitted tx hashes, receipt outcomes, balance-read block numbers, and dirty-user block numbers in a database, then make settlement workers resume only from that durable state. Before settlement, the worker would refresh balances and record the block; after submitting, it would store the tx hash/nonce before waiting for a receipt. Chain log events would mark users dirty at specific blocks, and a balance refresh would only clear dirty state if it was read at or after that block. After a restart, the service could safely reconstruct live orders, locked funds, pending settlements, and users that need refresh instead of relying on in-memory state.
 
+Other cool stuff I might try if I wanted to get another 0.1% and max this would be to add an explicit final `eth_call` simulation of the exact `Vault.matchOrders` transaction against the node’s "pending" state immediately before broadcast, after the service’s existing balance refresh and underfunded-fill pruning. That would catch many last-moment balance/allowance races locally, mark the affected users or fill dirty/stale, and skip sending a doomed transaction, turning some settlements_reverted or implicit send failures into measurable settlements_precheck_failed outcomes while keeping settlement_tx_attempts reserved for transactions the service actually broadcasts.
+
+
 
 Essentially if this crashes right now you are fucked, if it crashes in prod env you need to be able to fully replay // restore the entire state
 
 
 
 
-# Admission: 
+# MAIN SECTION: 
 ## Validate that users have sufficient fresh on-chain balance, net of hard locks, to cover each new order. A certain percentage of incoming orders are intentionally oversized and must be rejected.
 
 #### Note: the current service/contract model has no explicit maker/taker fees
