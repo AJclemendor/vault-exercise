@@ -35,24 +35,26 @@ impl Engine {
                 "order notional is too large to reserve safely".into(),
             ));
         };
-        let balance = self.balances.entry(request.user).or_default();
-
-        if balance.dirty || balance.last_refresh.is_none() {
+        let stale_balance = {
+            let balance = self.balances.entry(request.user).or_default();
+            balance.dirty || balance.last_refresh.is_none()
+        };
+        if stale_balance {
             self.record_order_rejected_stale_balance_cache();
             return Err(ApiError::Chain(
                 "balance cache is not fresh enough for admission".into(),
             ));
         }
 
-        let virtual_balance = sub_or_zero(balance.real, balance.reserved);
-        if virtual_balance < required {
+        let available = self.hard_available_for_user(request.user);
+        if available < required {
             self.record_order_rejected_insufficient_balance();
             return Err(ApiError::BadRequest(format!(
-                "insufficient available balance: required={required}, available={virtual_balance}"
+                "insufficient available balance: required={required}, available={available}"
             )));
         }
 
-        balance.reserved += required;
+        self.balances.entry(request.user).or_default().reserved += required;
 
         let id = format!("ord-{}", self.next_order_seq);
         let order = Order {
@@ -74,6 +76,9 @@ impl Engine {
             self.index_limit_order(order.side, order.price, id.clone());
         }
         self.orders.insert(id.clone(), order);
+        if request.order_type == OrderType::Market {
+            self.prune_user_to_balance(request.user, Some(id.clone()));
+        }
         self.stats.orders_accepted += 1;
 
         Ok(OrderResponse {

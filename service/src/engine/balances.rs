@@ -1,8 +1,8 @@
 use alloy::primitives::{Address, U256};
-use std::cmp::{Ordering, Reverse};
+use std::cmp::Ordering;
 use std::time::{Duration, Instant};
 
-use crate::types::{BalanceView, OrderStatus};
+use crate::types::BalanceView;
 
 use super::math::sub_or_zero;
 use super::{ACTIVE_CACHE_MAX_AGE, ADMISSION_CACHE_MAX_AGE, Engine};
@@ -102,48 +102,6 @@ impl Engine {
     }
 
     pub(crate) fn prune_user_to_balance(&mut self, user: Address, exact_order: Option<String>) {
-        let Some(balance) = self.balances.get(&user) else {
-            return;
-        };
-        if balance.real >= balance.reserved {
-            return;
-        }
-
-        if let Some(order_id) = exact_order {
-            self.terminal_order(&order_id, OrderStatus::Stale);
-            if self
-                .balances
-                .get(&user)
-                .map(|balance| balance.real >= balance.reserved)
-                .unwrap_or(true)
-            {
-                return;
-            }
-        }
-
-        let mut candidates: Vec<_> = self
-            .orders
-            .values()
-            .filter(|order| {
-                order.user == user
-                    && order.is_live()
-                    && order.in_flight_size.is_zero()
-                    && order.total_remaining() > U256::ZERO
-            })
-            .map(|order| (order.created_seq, order.id.clone()))
-            .collect();
-        candidates.sort_by_key(|candidate| Reverse(candidate.0));
-
-        for (_, order_id) in candidates {
-            self.terminal_order(&order_id, OrderStatus::Stale);
-            if self
-                .balances
-                .get(&user)
-                .map(|balance| balance.real >= balance.reserved)
-                .unwrap_or(true)
-            {
-                break;
-            }
-        }
+        self.stale_unsafe_live_orders_for_user(user, exact_order.as_deref());
     }
 }

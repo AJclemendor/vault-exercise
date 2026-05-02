@@ -1,7 +1,6 @@
 use alloy::primitives::{Address, U256};
 #[cfg(test)]
 use std::cmp::Ordering;
-use std::cmp::Reverse;
 
 use crate::types::{OrderStatus, OrderType, Side};
 
@@ -46,6 +45,7 @@ impl Engine {
         self.orders
             .values()
             .filter(|order| order.is_available_for_fill() && order.order_type == OrderType::Market)
+            .filter(|order| !self.user_has_in_flight_order(order.user))
             .min_by_key(|order| order.created_seq)
             .map(|order| order.id.clone())
     }
@@ -223,24 +223,17 @@ impl Engine {
         fill: &FillCandidate,
         user: Address,
     ) -> Option<U256> {
-        let balance = self.balances.get(&user)?;
-        let mut required = balance.reserved;
+        let mut required = U256::ZERO;
 
         if fill.buyer == user {
-            required = self.required_balance_after_order_fill(
-                required,
-                &fill.buy_id,
-                fill.fill_size,
-                fill.quote,
-            )?;
+            required = self
+                .required_balance_after_order_fill(&fill.buy_id, fill.fill_size, fill.quote)?
+                .max(required);
         }
         if fill.seller == user {
-            required = self.required_balance_after_order_fill(
-                required,
-                &fill.sell_id,
-                fill.fill_size,
-                fill.base,
-            )?;
+            required = self
+                .required_balance_after_order_fill(&fill.sell_id, fill.fill_size, fill.base)?
+                .max(required);
         }
 
         Some(required)
@@ -248,28 +241,12 @@ impl Engine {
 
     fn required_balance_after_order_fill(
         &self,
-        reserved: U256,
         order_id: &str,
         fill_size: U256,
         settlement_debit: U256,
     ) -> Option<U256> {
         let order = self.orders.get(order_id)?;
-        if order.in_flight_size < fill_size || order.total_remaining() < fill_size {
-            return None;
-        }
-
-        let old_required = reservation_for(order.side, order.price, order.total_remaining())?;
-        let post_fill_remaining = order.total_remaining() - fill_size;
-        let new_required = if post_fill_remaining.is_zero() {
-            U256::ZERO
-        } else {
-            reservation_for(order.side, order.price, post_fill_remaining)?
-        };
-
-        reserved
-            .checked_sub(old_required)?
-            .checked_add(new_required)?
-            .checked_add(settlement_debit)
+        self.required_balance_after_fill_for_order(order.user, order, fill_size, settlement_debit)
     }
 
     pub(crate) fn apply_settlement_success(&mut self, fill: &FillCandidate) {
@@ -279,6 +256,13 @@ impl Engine {
 
         let matched_orders = self.apply_order_fill(&fill.buy_id, fill.fill_size) as u64
             + self.apply_order_fill(&fill.sell_id, fill.fill_size) as u64;
+
+        self.stale_other_live_orders_for_user(fill.buyer, &fill.buy_id);
+        self.stale_unsafe_live_orders_for_user(fill.buyer, None);
+        if fill.seller != fill.buyer {
+            self.stale_other_live_orders_for_user(fill.seller, &fill.sell_id);
+            self.stale_unsafe_live_orders_for_user(fill.seller, None);
+        }
 
         self.stats.unique_orders_with_successful_fill += matched_orders;
         self.stats.order_sides_filled += 2;
@@ -371,25 +355,7 @@ impl Engine {
             return;
         }
 
-        let mut candidates: Vec<_> = self
-            .orders
-            .values()
-            .filter(|order| {
-                order.user == user
-                    && order.is_live()
-                    && order.in_flight_size.is_zero()
-                    && order.total_remaining() > U256::ZERO
-            })
-            .map(|order| (order.created_seq, order.id.clone()))
-            .collect();
-        candidates.sort_by_key(|candidate| Reverse(candidate.0));
-
-        for (_, order_id) in candidates {
-            self.terminal_order(&order_id, OrderStatus::Stale);
-            if self.user_funded_for_fill(fill, user) {
-                break;
-            }
-        }
+        self.stale_unsafe_live_orders_for_user(user, None);
     }
 }
 

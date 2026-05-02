@@ -144,7 +144,7 @@ fn market_order_matches_older_resting_limit_from_indexed_book() {
 }
 
 #[test]
-fn precheck_prunes_newer_reservations_before_staling_inflight_order() {
+fn precheck_allows_overbooked_competing_limit_until_fill_succeeds() {
     let mut engine = Engine::new();
     let buyer = address(1);
     let seller = address(2);
@@ -187,7 +187,166 @@ fn precheck_prunes_newer_reservations_before_staling_inflight_order() {
     assert!(seller_ok);
     assert!(engine.fill_still_pending(&fill));
     assert_eq!(engine.orders[&older_buy_id].status, OrderStatus::Open);
+    assert_eq!(engine.orders[&newer_buy_id].status, OrderStatus::Open);
+
+    engine.apply_settlement_success(&fill);
+
+    assert_eq!(engine.orders[&older_buy_id].status, OrderStatus::Filled);
     assert_eq!(engine.orders[&newer_buy_id].status, OrderStatus::Stale);
+}
+
+#[test]
+fn limit_orders_can_overbook_balance_when_each_order_is_individually_funded() {
+    let mut engine = Engine::new();
+    let buyer = address(1);
+    engine.apply_balance_refresh(buyer, wad(100), U256::ZERO);
+
+    let first = submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(90),
+    );
+    let second = submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(90),
+    );
+
+    assert_eq!(engine.orders[&first].status, OrderStatus::Open);
+    assert_eq!(engine.orders[&second].status, OrderStatus::Open);
+    let balance = engine.balance_view(buyer);
+    assert_eq!(balance.reserved, wad(180));
+    assert_eq!(balance.deficit, wad(80));
+    assert!(balance.over_reserved);
+}
+
+#[test]
+fn external_balance_drop_stales_overbooked_limits_that_no_longer_fit() {
+    let mut engine = Engine::new();
+    let buyer = address(1);
+    engine.apply_balance_refresh(buyer, wad(100), U256::ZERO);
+
+    let first = submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(90),
+    );
+    let second = submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(90),
+    );
+
+    engine.apply_balance_refresh(buyer, wad(80), U256::ZERO);
+    engine.prune_user_to_balance(buyer, None);
+
+    assert_eq!(engine.orders[&first].status, OrderStatus::Stale);
+    assert_eq!(engine.orders[&second].status, OrderStatus::Stale);
+    assert_eq!(engine.open_orders(Some(buyer)).len(), 0);
+}
+
+#[test]
+fn market_order_hard_lock_stales_limits_that_do_not_fit_residual_balance() {
+    let mut engine = Engine::new();
+    let buyer = address(1);
+    engine.apply_balance_refresh(buyer, wad(100), U256::ZERO);
+
+    let first_limit = submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(90),
+    );
+    let second_limit = submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(90),
+    );
+    let market = submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Market,
+        wad(1),
+        wad(15),
+    );
+
+    assert_eq!(engine.orders[&market].status, OrderStatus::Open);
+    assert_eq!(engine.orders[&first_limit].status, OrderStatus::Stale);
+    assert_eq!(engine.orders[&second_limit].status, OrderStatus::Stale);
+    assert_eq!(engine.balance_view(buyer).reserved, wad(15));
+}
+
+#[test]
+fn market_order_hard_lock_keeps_limits_that_fit_residual_balance() {
+    let mut engine = Engine::new();
+    let buyer = address(1);
+    engine.apply_balance_refresh(buyer, wad(100), U256::ZERO);
+
+    let limit = submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(90),
+    );
+    let market = submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Market,
+        wad(1),
+        wad(10),
+    );
+
+    assert_eq!(engine.orders[&market].status, OrderStatus::Open);
+    assert_eq!(engine.orders[&limit].status, OrderStatus::Open);
+    assert_eq!(engine.balance_view(buyer).reserved, wad(100));
+}
+
+#[test]
+fn market_order_admission_counts_existing_market_locks() {
+    let mut engine = Engine::new();
+    let buyer = address(1);
+    engine.apply_balance_refresh(buyer, wad(100), U256::ZERO);
+
+    let first_market = submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Market,
+        wad(1),
+        wad(90),
+    );
+    let second_market = engine.submit_order(SubmitOrderRequest {
+        user: buyer,
+        side: Side::Buy,
+        order_type: OrderType::Market,
+        price: wad(1),
+        size: wad(15),
+    });
+
+    assert_eq!(engine.orders[&first_market].status, OrderStatus::Open);
+    assert!(matches!(second_market, Err(ApiError::BadRequest(_))));
+    assert_eq!(engine.balance_view(buyer).reserved, wad(90));
 }
 
 #[test]
@@ -1185,6 +1344,55 @@ fn claim_fill_batch_does_not_double_select_in_flight_order() {
     let fills = engine.claim_fill_batch(2);
 
     assert_eq!(fills.len(), 1);
+}
+
+#[test]
+fn claim_fill_batch_does_not_select_multiple_orders_for_in_flight_user() {
+    let mut engine = Engine::new();
+    let buyer = address(1);
+    let seller_one = address(2);
+    let seller_two = address(3);
+    engine.apply_balance_refresh(buyer, wad(100), U256::ZERO);
+    engine.apply_balance_refresh(seller_one, wad(60), U256::ZERO);
+    engine.apply_balance_refresh(seller_two, wad(60), U256::ZERO);
+
+    submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(60),
+    );
+    submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(60),
+    );
+    submit(
+        &mut engine,
+        seller_one,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(60),
+    );
+    submit(
+        &mut engine,
+        seller_two,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(60),
+    );
+
+    let fills = engine.claim_fill_batch(2);
+
+    assert_eq!(fills.len(), 1);
+    assert!(engine.user_has_in_flight_order(buyer));
 }
 
 #[test]

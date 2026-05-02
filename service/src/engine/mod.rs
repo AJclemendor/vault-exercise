@@ -1,5 +1,6 @@
 mod balances;
 mod book;
+mod exposure;
 mod matching;
 mod math;
 mod orders;
