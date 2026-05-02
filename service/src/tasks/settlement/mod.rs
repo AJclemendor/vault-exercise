@@ -13,10 +13,10 @@ use outcome::{
 };
 use std::env;
 use std::sync::Arc;
-use std::time::Duration;
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-const MATCH_IDLE_SLEEP: Duration = Duration::from_millis(25);
 const USER_SETTLEMENT_LOCK_STRIPES: usize = 256;
 
 type PendingSettlement = PendingTransactionBuilder<Ethereum>;
@@ -107,7 +107,7 @@ pub(super) enum PostSubmitFailurePolicy {
     StaleBothOrders,
 }
 
-pub(crate) async fn settlement_loop(state: AppState) {
+pub(crate) async fn settlement_loop(state: AppState, fill_rx: UnboundedReceiver<FillCandidate>) {
     let config = SettlementConfig::from_env();
     println!(
         "[config] settlement_mode={} settlement_concurrency={} settlement_receipt_concurrency={} max_unresolved_settlements={} max_inflight_fills={} max_fill_claim_batch={}",
@@ -120,30 +120,28 @@ pub(crate) async fn settlement_loop(state: AppState) {
     );
 
     match config.mode {
-        SettlementMode::Sequential => sequential_settlement_loop(state).await,
+        SettlementMode::Sequential => sequential_settlement_loop(state, fill_rx).await,
         SettlementMode::ReceiptConcurrent => {
-            receipt_concurrent_settlement_loop(state, config).await
+            receipt_concurrent_settlement_loop(state, fill_rx, config).await
         }
-        SettlementMode::Concurrent => concurrent_settlement_loop(state, config).await,
+        SettlementMode::Concurrent => concurrent_settlement_loop(state, fill_rx, config).await,
     }
 }
 
-async fn sequential_settlement_loop(state: AppState) {
-    loop {
-        let fill = {
-            let mut engine = state.engine.lock().await;
-            engine.claim_next_fill_candidate()
-        };
-        let Some(fill) = fill else {
-            tokio::time::sleep(MATCH_IDLE_SLEEP).await;
-            continue;
-        };
-
+async fn sequential_settlement_loop(
+    state: AppState,
+    mut fill_rx: UnboundedReceiver<FillCandidate>,
+) {
+    while let Some(fill) = fill_rx.recv().await {
         process_fill(&state, &fill).await;
     }
 }
 
-async fn receipt_concurrent_settlement_loop(state: AppState, config: SettlementConfig) {
+async fn receipt_concurrent_settlement_loop(
+    state: AppState,
+    mut fill_rx: UnboundedReceiver<FillCandidate>,
+    config: SettlementConfig,
+) {
     let receipt_permits = Arc::new(Semaphore::new(config.receipt_concurrency));
     let unresolved_permits = Arc::new(Semaphore::new(config.max_unresolved_settlements));
     let apply_gate = Arc::new(OrderedGate::new(1));
@@ -154,14 +152,10 @@ async fn receipt_concurrent_settlement_loop(state: AppState, config: SettlementC
             .acquire_owned()
             .await
             .expect("settlement unresolved semaphore should not close");
-        let fill = {
-            let mut engine = state.engine.lock().await;
-            engine.claim_next_fill_candidate()
-        };
+        let fill = fill_rx.recv().await;
         let Some(fill) = fill else {
             drop(unresolved_permit);
-            tokio::time::sleep(MATCH_IDLE_SLEEP).await;
-            continue;
+            break;
         };
 
         match prepare_fill_for_submit(&state, &fill).await {
@@ -197,7 +191,11 @@ async fn receipt_concurrent_settlement_loop(state: AppState, config: SettlementC
     }
 }
 
-async fn concurrent_settlement_loop(state: AppState, config: SettlementConfig) {
+async fn concurrent_settlement_loop(
+    state: AppState,
+    mut fill_rx: UnboundedReceiver<FillCandidate>,
+    config: SettlementConfig,
+) {
     let worker_permits = Arc::new(Semaphore::new(config.concurrency));
     let inflight_permits = Arc::new(Semaphore::new(config.max_inflight_fills));
     let receipt_permits = Arc::new(Semaphore::new(config.receipt_concurrency));
@@ -221,17 +219,20 @@ async fn concurrent_settlement_loop(state: AppState, config: SettlementConfig) {
             .available_permits()
             .min(inflight_permits.available_permits())
             .min(config.max_fill_claim_batch.saturating_sub(1));
-        let claim_generation = reorder_state.generation();
-        let fills = {
-            let mut engine = state.engine.lock().await;
-            engine.claim_fill_batch(capacity)
-        };
-
-        if fills.is_empty() {
+        let Some(first_fill) = fill_rx.recv().await else {
             drop(first_worker_permit);
             drop(first_inflight_permit);
-            tokio::time::sleep(MATCH_IDLE_SLEEP).await;
-            continue;
+            break;
+        };
+        let claim_generation = reorder_state.generation();
+        let mut fills = Vec::with_capacity(capacity);
+        fills.push(first_fill);
+        while fills.len() < capacity {
+            match fill_rx.try_recv() {
+                Ok(fill) => fills.push(fill),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
+            }
         }
 
         let mut worker_permits_for_batch = Vec::with_capacity(fills.len());

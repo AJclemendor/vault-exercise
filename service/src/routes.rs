@@ -46,9 +46,16 @@ pub(crate) async fn submit_order(
         }
     }
 
-    let mut engine = state.engine.lock().await;
-    let response = engine.submit_order(request)?;
-    Ok(Json(response))
+    let admission = {
+        let mut engine = state.engine.lock().await;
+        engine.submit_order_and_claim_fills(request)?
+    };
+    for fill in admission.fills {
+        if state.settlement_queue.send(fill).is_err() {
+            return Err(ApiError::Chain("settlement queue is closed".into()));
+        }
+    }
+    Ok(Json(admission.response))
 }
 
 pub(crate) async fn cancel_order(

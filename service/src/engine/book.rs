@@ -65,6 +65,7 @@ impl Engine {
                     && order.order_type == OrderType::Limit
                     && order.is_live()
                     && order.available_remaining() > U256::ZERO
+                    && !self.user_has_in_flight_order(order.user)
                 {
                     size += order.available_remaining();
                     orders += 1;
@@ -131,6 +132,7 @@ impl Engine {
                     && order.price == price
                     && order.order_type == OrderType::Limit
                     && order.is_available_for_fill()
+                    && !self.user_has_in_flight_order(order.user)
             })
             .unwrap_or(false)
     }
