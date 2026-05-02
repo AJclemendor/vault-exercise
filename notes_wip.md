@@ -132,6 +132,18 @@ The harness changes are limited to connection pooling and runtime control; they 
 
 
 
+
+# General concurrency things
+The main concurrency change is that slow blockchain settlement work was moved out of the POST /orders path. The harness now reuses pooled HTTP/RPC clients, so it can generate high-concurrency load without wasting time on connection setup. On the service side, order admission and matching are still sequenced through admission tickets and the engine mutex, which keeps order IDs, fill IDs, book mutation, and price-time priority deterministic even when requests arrive concurrently.
+
+Market orders now cross immediately and cancel any leftover size, while marketable limit orders also match immediately. The HTTP path creates fill candidates and pushes them to async settlement workers. Those workers handle balance refreshes, Vault.matchOrders(...), and receipts in the background, using bounds like semaphores, per-user locks, and apply gates so settlement can run concurrently without corrupting the book state chosen by the matching engine.
+
+Admission tickets are just a FIFO gate for POST /orders.
+
+
+
+
+
 # Ghost Orders And Limitations
 
 
@@ -147,21 +159,6 @@ In production, I would persist orders, reservations, fills, submitted tx hashes,
 
 
 Essentially if this crashes right now you are fucked, if it crashes in prod env you need to be able to fully replay // restore the entire state
-
-
-
-# General concurrency things
-
-Before these changes, the harness created a lot of concurrent pressure, but the service was doing too much slow work in the wrong places. Matching was more background-driven, market orders could wait around instead of crossing immediately, and the old book logic relied more on broad scans. Under load, that made the system slower and caused more orders to miss admission or matching opportunities.
-
-Now, the harness reuses pooled HTTP/RPC clients, so it can generate cleaner high-concurrency load without wasting time on connection overhead. On the service side, `POST /orders` still accepts concurrent requests, but admission and matching are sequenced so the book stays deterministic. Market orders cross immediately and cancel any leftover size, limit orders cross immediately if marketable, and fill candidates are pushed to async settlement workers.
-
-Order is maintained mainly in `service/src/routes.rs`, `service/src/sequencing.rs`, and the engine modules. Each order request gets an admission ticket, waits for its turn, then mutates the engine while holding the engine mutex. That means even if many HTTP requests arrive at once, only one request at a time can assign order IDs, insert into the book, create fills, and update reserved balances. The book itself uses sorted `BTreeMap` price levels and FIFO `VecDeque`s inside each level, so price-time priority is preserved.
-
-The main async work lives in `service/src/tasks/settlement/`. The HTTP path creates fill candidates and pushes them onto the settlement queue, but workers handle the settlement blockchain work later. Admission can still refresh a user's balance on-chain before accepting an order. Settlement can refresh buyer/seller balances, submit `Vault.matchOrders(...)`, and wait for receipts asynchronously. In `receipt_concurrent` mode, receipt work is bounded and applied in order. In full `concurrent` mode, worker/in-flight/receipt semaphores, per-user locks, and tx/apply gates bound background work while preserving fill-order application.
-
-The main result is that settlement blockchain work is pushed out of the request path while the matching decision happens right away. The core ordering rules did not change. The service still processes book mutations one at a time through the admission sequencer and engine mutex, so order IDs, fill IDs, price-time priority, and FIFO within each price level stay deterministic. Settlement can happen asynchronously after that, but settlement gates, semaphores, and per-user locks make sure the background workers do not corrupt the order that the engine already decided.
-
 
 
 
