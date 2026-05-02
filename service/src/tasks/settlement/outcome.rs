@@ -11,6 +11,7 @@ use tokio::sync::OwnedSemaphorePermit;
 
 const UNCERTAIN_RECEIPT_RECHECKS: usize = 20;
 const UNCERTAIN_RECEIPT_RECHECK_INTERVAL: Duration = Duration::from_millis(250);
+const DEFERRED_RECEIPT_RECHECKS: usize = 30;
 const DEFERRED_RECEIPT_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 pub(super) async fn process_fill(state: &AppState, fill: &FillCandidate) {
@@ -277,16 +278,13 @@ fn hold_unresolved_settlement(
 
 fn spawn_uncertain_settlement_reconciler(state: AppState, fill: FillCandidate, tx_hash: TxHash) {
     tokio::spawn(async move {
-        let mut attempts = 0usize;
-
-        loop {
-            attempts += 1;
+        for attempt in 1..=DEFERRED_RECEIPT_RECHECKS {
             tokio::time::sleep(DEFERRED_RECEIPT_RECHECK_INTERVAL).await;
             match state.chain.settlement_receipt_status(tx_hash).await {
                 Ok(Some(SettlementReceiptStatus::Succeeded)) => {
                     eprintln!(
                         "[settlement] deferred receipt resolved success seq={} tx={} attempt={}",
-                        fill.seq, tx_hash, attempts
+                        fill.seq, tx_hash, attempt
                     );
                     apply_confirmed_settlement_success(&state, &fill).await;
                     return;
@@ -294,23 +292,36 @@ fn spawn_uncertain_settlement_reconciler(state: AppState, fill: FillCandidate, t
                 Ok(Some(SettlementReceiptStatus::Reverted)) => {
                     eprintln!(
                         "[settlement] deferred receipt resolved revert seq={} tx={} attempt={}",
-                        fill.seq, tx_hash, attempts
+                        fill.seq, tx_hash, attempt
                     );
                     abort_confirmed_reverted_settlement(&state, &fill).await;
                     return;
                 }
                 Ok(None) => {}
                 Err(err) => {
-                    if attempts == 1 || attempts % 30 == 0 {
+                    if attempt == 1 || attempt == DEFERRED_RECEIPT_RECHECKS {
                         eprintln!(
                             "[settlement] deferred receipt still unresolved seq={} tx={} attempt={}: {err:#}",
-                            fill.seq, tx_hash, attempts
+                            fill.seq, tx_hash, attempt
                         );
                     }
                 }
             }
         }
+
+        eprintln!(
+            "[settlement] deferred receipt timed out seq={} tx={} checks={}; staling both orders",
+            fill.seq, tx_hash, DEFERRED_RECEIPT_RECHECKS
+        );
+        let mut engine = state.engine.lock().await;
+        time_out_unresolved_settlement(&mut engine, &fill);
     });
+}
+
+fn time_out_unresolved_settlement(engine: &mut Engine, fill: &FillCandidate) {
+    engine.mark_dirty(fill.buyer);
+    engine.mark_dirty(fill.seller);
+    engine.abort_fill(fill, true, true);
 }
 
 async fn apply_confirmed_settlement_success(state: &AppState, fill: &FillCandidate) {

@@ -113,6 +113,51 @@ fn unresolved_receipt_keeps_fill_pending_and_reservations_locked() {
 }
 
 #[test]
+fn unresolved_receipt_timeout_stales_orders_and_releases_reservations() {
+    let mut engine = Engine::new();
+    let buyer = address(1);
+    let seller = address(2);
+    engine.apply_balance_refresh(buyer, wad(20), U256::ZERO);
+    engine.apply_balance_refresh(seller, wad(10), U256::ZERO);
+    submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+    submit(
+        &mut engine,
+        seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+    let fill = engine.next_fill_candidate().expect("orders should cross");
+    hold_unresolved_settlement(
+        &mut engine,
+        &fill,
+        &SettlementConfirmationError::Receipt(anyhow::anyhow!("receipt rpc timed out")),
+    );
+
+    time_out_unresolved_settlement(&mut engine, &fill);
+
+    assert!(!engine.fill_still_pending(&fill));
+    assert!(engine.open_orders(Some(buyer)).is_empty());
+    assert!(engine.open_orders(Some(seller)).is_empty());
+    assert_eq!(engine.balance_view(buyer).reserved, U256::ZERO);
+    assert_eq!(engine.balance_view(seller).reserved, U256::ZERO);
+    assert!(engine.balance_view(buyer).stale);
+    assert!(engine.balance_view(seller).stale);
+    let snapshot = engine.stats_snapshot();
+    assert_eq!(snapshot.settlement_receipt_failures, 1);
+    assert_eq!(snapshot.settlement_unknown_outcomes, 1);
+    assert_eq!(snapshot.orders_marked_stale, 2);
+}
+
+#[test]
 fn confirmation_reverts_are_known_failures() {
     assert_eq!(
         settlement_confirmation_failure_action(&SettlementConfirmationError::Reverted),

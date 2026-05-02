@@ -46,6 +46,27 @@ pub(crate) async fn submit_order(
         }
     }
 
+    let needs_refresh_after_wait = {
+        let engine = state.engine.lock().await;
+        engine.balance_needs_admission_refresh(user)
+    };
+    if needs_refresh_after_wait {
+        match state.chain.read_user_balances(user).await {
+            Ok((real, vault)) => {
+                let mut engine = state.engine.lock().await;
+                engine.apply_balance_refresh(user, real, vault);
+                engine.record_admission_refresh_succeeded();
+            }
+            Err(err) => {
+                let mut engine = state.engine.lock().await;
+                engine.record_admission_refresh_failed();
+                return Err(ApiError::Chain(format!(
+                    "failed to refresh balance for admission after sequencing: {err:#}"
+                )));
+            }
+        }
+    }
+
     let admission = {
         let mut engine = state.engine.lock().await;
         engine.submit_order_and_claim_fills(request)?
