@@ -726,6 +726,519 @@ fn best_crossing_limits_preserves_price_priority_before_fifo_when_skipping_self_
 }
 
 #[test]
+fn best_bid_wins_before_older_worse_bid() {
+    let mut engine = Engine::new();
+    let older_buyer = address(1);
+    let better_buyer = address(2);
+    let seller = address(3);
+    engine.apply_balance_refresh(older_buyer, wad(10), U256::ZERO);
+    engine.apply_balance_refresh(better_buyer, wad(20), U256::ZERO);
+    engine.apply_balance_refresh(seller, wad(10), U256::ZERO);
+
+    submit(
+        &mut engine,
+        older_buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(1),
+    );
+    let better_buy_id = submit(
+        &mut engine,
+        better_buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(2),
+        wad(1),
+    );
+    let sell_id = submit(
+        &mut engine,
+        seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(1),
+    );
+
+    let fill = engine
+        .next_fill_candidate()
+        .expect("best bid should cross first");
+    assert_eq!(fill.buy_id, better_buy_id);
+    assert_eq!(fill.sell_id, sell_id);
+}
+
+#[test]
+fn best_ask_wins_before_older_worse_ask() {
+    let mut engine = Engine::new();
+    let buyer = address(1);
+    let older_seller = address(2);
+    let better_seller = address(3);
+    engine.apply_balance_refresh(buyer, wad(20), U256::ZERO);
+    engine.apply_balance_refresh(older_seller, wad(20), U256::ZERO);
+    engine.apply_balance_refresh(better_seller, wad(20), U256::ZERO);
+
+    submit(
+        &mut engine,
+        older_seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(2),
+        wad(1),
+    );
+    let better_sell_id = submit(
+        &mut engine,
+        better_seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(1),
+    );
+    let buy_id = submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(2),
+        wad(1),
+    );
+
+    let fill = engine
+        .next_fill_candidate()
+        .expect("best ask should cross first");
+    assert_eq!(fill.buy_id, buy_id);
+    assert_eq!(fill.sell_id, better_sell_id);
+}
+
+#[test]
+fn fifo_holds_within_same_bid_price() {
+    let mut engine = Engine::new();
+    let older_buyer = address(1);
+    let newer_buyer = address(2);
+    let seller = address(3);
+    engine.apply_balance_refresh(older_buyer, wad(10), U256::ZERO);
+    engine.apply_balance_refresh(newer_buyer, wad(10), U256::ZERO);
+    engine.apply_balance_refresh(seller, wad(10), U256::ZERO);
+
+    let older_buy_id = submit(
+        &mut engine,
+        older_buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(1),
+    );
+    submit(
+        &mut engine,
+        newer_buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(1),
+    );
+    submit(
+        &mut engine,
+        seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(1),
+    );
+
+    let fill = engine
+        .next_fill_candidate()
+        .expect("oldest same-price bid should cross first");
+    assert_eq!(fill.buy_id, older_buy_id);
+}
+
+#[test]
+fn fifo_holds_within_same_ask_price() {
+    let mut engine = Engine::new();
+    let buyer = address(1);
+    let older_seller = address(2);
+    let newer_seller = address(3);
+    engine.apply_balance_refresh(buyer, wad(10), U256::ZERO);
+    engine.apply_balance_refresh(older_seller, wad(10), U256::ZERO);
+    engine.apply_balance_refresh(newer_seller, wad(10), U256::ZERO);
+
+    let older_sell_id = submit(
+        &mut engine,
+        older_seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(1),
+    );
+    submit(
+        &mut engine,
+        newer_seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(1),
+    );
+    submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(1),
+    );
+
+    let fill = engine
+        .next_fill_candidate()
+        .expect("oldest same-price ask should cross first");
+    assert_eq!(fill.sell_id, older_sell_id);
+}
+
+#[test]
+fn oldest_market_order_is_handled_first() {
+    let mut engine = Engine::new();
+    let seller = address(1);
+    let first_buyer = address(2);
+    let second_buyer = address(3);
+    engine.apply_balance_refresh(seller, wad(10), U256::ZERO);
+    engine.apply_balance_refresh(first_buyer, wad(10), U256::ZERO);
+    engine.apply_balance_refresh(second_buyer, wad(10), U256::ZERO);
+
+    let sell_id = submit(
+        &mut engine,
+        seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(2),
+    );
+    let first_market_id = submit(
+        &mut engine,
+        first_buyer,
+        Side::Buy,
+        OrderType::Market,
+        wad(1),
+        wad(1),
+    );
+    submit(
+        &mut engine,
+        second_buyer,
+        Side::Buy,
+        OrderType::Market,
+        wad(1),
+        wad(1),
+    );
+
+    let fill = engine
+        .next_fill_candidate()
+        .expect("oldest market order should be handled first");
+    assert_eq!(fill.buy_id, first_market_id);
+    assert_eq!(fill.sell_id, sell_id);
+}
+
+#[test]
+fn claimed_fill_marks_both_orders_in_flight() {
+    let mut engine = Engine::new();
+    let buyer = address(1);
+    let seller = address(2);
+    engine.apply_balance_refresh(buyer, wad(10), U256::ZERO);
+    engine.apply_balance_refresh(seller, wad(10), U256::ZERO);
+
+    let buy_id = submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(1),
+    );
+    let sell_id = submit(
+        &mut engine,
+        seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(1),
+    );
+
+    let fill = engine.next_fill_candidate().expect("orders should cross");
+
+    assert_eq!(engine.orders[&buy_id].in_flight_size, fill.fill_size);
+    assert_eq!(engine.orders[&sell_id].in_flight_size, fill.fill_size);
+}
+
+#[test]
+fn abort_releases_in_flight_and_preserves_priority() {
+    let mut engine = Engine::new();
+    let older_buyer = address(1);
+    let newer_buyer = address(2);
+    let seller = address(3);
+    engine.apply_balance_refresh(older_buyer, wad(10), U256::ZERO);
+    engine.apply_balance_refresh(newer_buyer, wad(10), U256::ZERO);
+    engine.apply_balance_refresh(seller, wad(10), U256::ZERO);
+
+    let older_buy_id = submit(
+        &mut engine,
+        older_buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(1),
+    );
+    submit(
+        &mut engine,
+        newer_buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(1),
+    );
+    let sell_id = submit(
+        &mut engine,
+        seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(1),
+    );
+
+    let aborted = engine
+        .next_fill_candidate()
+        .expect("oldest bid should cross first");
+    engine.abort_fill(&aborted, false, false);
+    let retried = engine
+        .next_fill_candidate()
+        .expect("same priority fill should be selected after abort");
+
+    assert_eq!(retried.buy_id, older_buy_id);
+    assert_eq!(retried.sell_id, sell_id);
+}
+
+#[test]
+fn partial_success_updates_indexed_book_levels() {
+    let mut engine = Engine::new();
+    let buyer = address(1);
+    let seller = address(2);
+    engine.apply_balance_refresh(buyer, wad(20), U256::ZERO);
+    engine.apply_balance_refresh(seller, wad(10), U256::ZERO);
+
+    submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(20),
+    );
+    submit(
+        &mut engine,
+        seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+    let fill = engine.next_fill_candidate().expect("orders should cross");
+    engine.apply_settlement_success(&fill);
+
+    let snapshot = engine.book_snapshot(10);
+    assert_eq!(snapshot.bids.len(), 1);
+    assert_eq!(snapshot.bids[0].price_raw, wad(1));
+    assert_eq!(snapshot.bids[0].size_raw, wad(10));
+    assert!(snapshot.asks.is_empty());
+}
+
+#[test]
+fn claim_fill_batch_matches_repeated_single_claims() {
+    let mut batched = Engine::new();
+    let mut repeated = Engine::new();
+    for engine in [&mut batched, &mut repeated] {
+        for byte in 1..=4 {
+            engine.apply_balance_refresh(address(byte), wad(10), U256::ZERO);
+        }
+        submit(
+            engine,
+            address(1),
+            Side::Buy,
+            OrderType::Limit,
+            wad(1),
+            wad(1),
+        );
+        submit(
+            engine,
+            address(2),
+            Side::Sell,
+            OrderType::Limit,
+            wad(1),
+            wad(1),
+        );
+        submit(
+            engine,
+            address(3),
+            Side::Buy,
+            OrderType::Limit,
+            wad(1),
+            wad(1),
+        );
+        submit(
+            engine,
+            address(4),
+            Side::Sell,
+            OrderType::Limit,
+            wad(1),
+            wad(1),
+        );
+    }
+
+    let batched_pairs: Vec<_> = batched
+        .claim_fill_batch(2)
+        .into_iter()
+        .map(|fill| (fill.seq, fill.buy_id, fill.sell_id))
+        .collect();
+    let repeated_pairs: Vec<_> = (0..2)
+        .map(|_| {
+            let fill = repeated
+                .claim_next_fill_candidate()
+                .expect("fill should be available");
+            (fill.seq, fill.buy_id, fill.sell_id)
+        })
+        .collect();
+
+    assert_eq!(batched_pairs, repeated_pairs);
+}
+
+#[test]
+fn claim_fill_batch_does_not_double_select_in_flight_order() {
+    let mut engine = Engine::new();
+    let buyer = address(1);
+    let seller_one = address(2);
+    let seller_two = address(3);
+    engine.apply_balance_refresh(buyer, wad(20), U256::ZERO);
+    engine.apply_balance_refresh(seller_one, wad(10), U256::ZERO);
+    engine.apply_balance_refresh(seller_two, wad(10), U256::ZERO);
+
+    submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(20),
+    );
+    submit(
+        &mut engine,
+        seller_one,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+    submit(
+        &mut engine,
+        seller_two,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+
+    let fills = engine.claim_fill_batch(2);
+
+    assert_eq!(fills.len(), 1);
+}
+
+#[test]
+fn claim_fill_batch_preserves_fifo_within_price_level() {
+    let mut engine = Engine::new();
+    for byte in 1..=6 {
+        engine.apply_balance_refresh(address(byte), wad(10), U256::ZERO);
+    }
+
+    let first_buy = submit(
+        &mut engine,
+        address(1),
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(1),
+    );
+    let second_buy = submit(
+        &mut engine,
+        address(2),
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(1),
+    );
+    let first_sell = submit(
+        &mut engine,
+        address(3),
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(1),
+    );
+    let second_sell = submit(
+        &mut engine,
+        address(4),
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(1),
+    );
+
+    let fills = engine.claim_fill_batch(2);
+
+    assert_eq!(fills[0].buy_id, first_buy);
+    assert_eq!(fills[0].sell_id, first_sell);
+    assert_eq!(fills[1].buy_id, second_buy);
+    assert_eq!(fills[1].sell_id, second_sell);
+}
+
+#[test]
+fn claim_multiple_fills_do_not_overlap_orders() {
+    let mut engine = Engine::new();
+    for byte in 1..=4 {
+        engine.apply_balance_refresh(address(byte), wad(10), U256::ZERO);
+    }
+
+    submit(
+        &mut engine,
+        address(1),
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(1),
+    );
+    submit(
+        &mut engine,
+        address(2),
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(1),
+    );
+    submit(
+        &mut engine,
+        address(3),
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(1),
+    );
+    submit(
+        &mut engine,
+        address(4),
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(1),
+    );
+
+    let fills = engine.claim_fill_batch(2);
+
+    assert_ne!(fills[0].buy_id, fills[1].buy_id);
+    assert_ne!(fills[0].sell_id, fills[1].sell_id);
+}
+
+#[test]
 fn buy_order_with_overflowing_notional_is_rejected() {
     let mut engine = Engine::new();
     let buyer = address(1);

@@ -1,4 +1,6 @@
 use super::*;
+use crate::chain::SettlementConfirmationError;
+use crate::engine::Engine;
 use crate::types::{OrderStatus, OrderType, Side, SubmitOrderRequest};
 use alloy::primitives::{Address, U256};
 

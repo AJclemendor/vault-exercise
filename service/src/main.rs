@@ -1,12 +1,14 @@
 mod chain;
 mod engine;
 mod routes;
+mod sequencing;
 mod stats;
 mod tasks;
 mod types;
 
 use crate::chain::ChainClient;
 use crate::engine::Engine;
+use crate::sequencing::AdmissionSequencer;
 use anyhow::{Context, Result};
 use axum::Router;
 use axum::routing::{delete, get, post};
@@ -43,6 +45,7 @@ impl Config {
 pub(crate) struct AppState {
     pub(crate) engine: Arc<Mutex<Engine>>,
     pub(crate) chain: ChainClient,
+    pub(crate) admission: Arc<AdmissionSequencer>,
 }
 
 #[tokio::main]
@@ -57,6 +60,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         engine: Arc::new(Mutex::new(Engine::new())),
         chain,
+        admission: Arc::new(AdmissionSequencer::new()),
     };
 
     spawn_background_tasks(state.clone());

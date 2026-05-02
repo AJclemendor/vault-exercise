@@ -1,0 +1,423 @@
+mod concurrency;
+mod outcome;
+
+use crate::engine::FillCandidate;
+use crate::sequencing::OrderedGate;
+use crate::AppState;
+use alloy::network::Ethereum;
+use alloy::providers::PendingTransactionBuilder;
+use concurrency::{PreSubmitReorderState, UserSettlementLocks};
+use outcome::{
+    confirm_and_apply_settlement, prepare_fill_for_submit, process_fill, refresh_for_settlement,
+    spawn_receipt_task, submit_settlement_once,
+};
+use std::env;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+const MATCH_IDLE_SLEEP: Duration = Duration::from_millis(25);
+const USER_SETTLEMENT_LOCK_STRIPES: usize = 256;
+
+type PendingSettlement = PendingTransactionBuilder<Ethereum>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettlementMode {
+    Sequential,
+    ReceiptConcurrent,
+    Concurrent,
+}
+
+impl SettlementMode {
+    fn from_env() -> Self {
+        match env::var("SETTLEMENT_MODE")
+            .unwrap_or_else(|_| "receipt_concurrent".into())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "sequential" => Self::Sequential,
+            "receipt_concurrent" => Self::ReceiptConcurrent,
+            "concurrent" => Self::Concurrent,
+            value => {
+                eprintln!("[config] unknown SETTLEMENT_MODE={value}; using receipt_concurrent");
+                Self::ReceiptConcurrent
+            }
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Sequential => "sequential",
+            Self::ReceiptConcurrent => "receipt_concurrent",
+            Self::Concurrent => "concurrent",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SettlementConfig {
+    mode: SettlementMode,
+    concurrency: usize,
+    receipt_concurrency: usize,
+    max_unresolved_settlements: usize,
+    max_inflight_fills: usize,
+    max_fill_claim_batch: usize,
+}
+
+impl SettlementConfig {
+    fn from_env() -> Self {
+        let mode = SettlementMode::from_env();
+        let default_concurrency = if mode == SettlementMode::Concurrent {
+            16
+        } else {
+            1
+        };
+        Self {
+            mode,
+            concurrency: parse_usize_env("SETTLEMENT_CONCURRENCY", default_concurrency).max(1),
+            receipt_concurrency: parse_usize_env("SETTLEMENT_RECEIPT_CONCURRENCY", 64).max(1),
+            max_unresolved_settlements: parse_usize_env("MAX_UNRESOLVED_SETTLEMENTS", 64).max(1),
+            max_inflight_fills: parse_usize_env("MAX_INFLIGHT_FILLS", 64).max(1),
+            max_fill_claim_batch: parse_usize_env("MAX_FILL_CLAIM_BATCH", 16).max(1),
+        }
+    }
+}
+
+fn parse_usize_env(name: &str, default: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PreSubmitDecision {
+    Submit,
+    Abort,
+}
+
+pub(super) enum SubmitOutcome {
+    Submitted(PendingSettlement),
+    SendFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PostSubmitFailurePolicy {
+    ReleaseOrPrune,
+    StaleBothOrders,
+}
+
+pub(crate) async fn settlement_loop(state: AppState) {
+    let config = SettlementConfig::from_env();
+    println!(
+        "[config] settlement_mode={} settlement_concurrency={} settlement_receipt_concurrency={} max_unresolved_settlements={} max_inflight_fills={} max_fill_claim_batch={}",
+        config.mode.as_str(),
+        config.concurrency,
+        config.receipt_concurrency,
+        config.max_unresolved_settlements,
+        config.max_inflight_fills,
+        config.max_fill_claim_batch
+    );
+
+    match config.mode {
+        SettlementMode::Sequential => sequential_settlement_loop(state).await,
+        SettlementMode::ReceiptConcurrent => {
+            receipt_concurrent_settlement_loop(state, config).await
+        }
+        SettlementMode::Concurrent => concurrent_settlement_loop(state, config).await,
+    }
+}
+
+async fn sequential_settlement_loop(state: AppState) {
+    loop {
+        let fill = {
+            let mut engine = state.engine.lock().await;
+            engine.claim_next_fill_candidate()
+        };
+        let Some(fill) = fill else {
+            tokio::time::sleep(MATCH_IDLE_SLEEP).await;
+            continue;
+        };
+
+        process_fill(&state, &fill).await;
+    }
+}
+
+async fn receipt_concurrent_settlement_loop(state: AppState, config: SettlementConfig) {
+    let receipt_permits = Arc::new(Semaphore::new(config.receipt_concurrency));
+    let unresolved_permits = Arc::new(Semaphore::new(config.max_unresolved_settlements));
+    let apply_gate = Arc::new(OrderedGate::new(1));
+
+    loop {
+        let unresolved_permit = unresolved_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("settlement unresolved semaphore should not close");
+        let fill = {
+            let mut engine = state.engine.lock().await;
+            engine.claim_next_fill_candidate()
+        };
+        let Some(fill) = fill else {
+            drop(unresolved_permit);
+            tokio::time::sleep(MATCH_IDLE_SLEEP).await;
+            continue;
+        };
+
+        match prepare_fill_for_submit(&state, &fill).await {
+            PreSubmitDecision::Abort => {
+                apply_gate.complete(fill.seq);
+                drop(unresolved_permit);
+                continue;
+            }
+            PreSubmitDecision::Submit => {}
+        }
+
+        match submit_settlement_once(&state, &fill).await {
+            SubmitOutcome::SendFailed => {
+                apply_gate.complete(fill.seq);
+                drop(unresolved_permit);
+            }
+            SubmitOutcome::Submitted(pending) => {
+                let receipt_permit = receipt_permits
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("settlement receipt semaphore should not close");
+                spawn_receipt_task(
+                    state.clone(),
+                    fill,
+                    pending,
+                    apply_gate.clone(),
+                    receipt_permit,
+                    unresolved_permit,
+                );
+            }
+        }
+    }
+}
+
+async fn concurrent_settlement_loop(state: AppState, config: SettlementConfig) {
+    let worker_permits = Arc::new(Semaphore::new(config.concurrency));
+    let inflight_permits = Arc::new(Semaphore::new(config.max_inflight_fills));
+    let receipt_permits = Arc::new(Semaphore::new(config.receipt_concurrency));
+    let tx_gate = Arc::new(OrderedGate::new(1));
+    let apply_gate = Arc::new(OrderedGate::new(1));
+    let user_locks = Arc::new(UserSettlementLocks::new(USER_SETTLEMENT_LOCK_STRIPES));
+    let reorder_state = Arc::new(PreSubmitReorderState::new());
+
+    loop {
+        let first_worker_permit = worker_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("settlement worker semaphore should not close");
+        let first_inflight_permit = inflight_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("settlement in-flight semaphore should not close");
+        let capacity = 1 + worker_permits
+            .available_permits()
+            .min(inflight_permits.available_permits())
+            .min(config.max_fill_claim_batch.saturating_sub(1));
+        let claim_generation = reorder_state.generation();
+        let fills = {
+            let mut engine = state.engine.lock().await;
+            engine.claim_fill_batch(capacity)
+        };
+
+        if fills.is_empty() {
+            drop(first_worker_permit);
+            drop(first_inflight_permit);
+            tokio::time::sleep(MATCH_IDLE_SLEEP).await;
+            continue;
+        }
+
+        let mut worker_permits_for_batch = Vec::with_capacity(fills.len());
+        let mut inflight_permits_for_batch = Vec::with_capacity(fills.len());
+        worker_permits_for_batch.push(first_worker_permit);
+        inflight_permits_for_batch.push(first_inflight_permit);
+        for _ in 1..fills.len() {
+            worker_permits_for_batch.push(
+                worker_permits
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("settlement worker semaphore should not close"),
+            );
+            inflight_permits_for_batch.push(
+                inflight_permits
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("settlement in-flight semaphore should not close"),
+            );
+        }
+
+        for ((fill, worker_permit), inflight_permit) in fills
+            .into_iter()
+            .zip(worker_permits_for_batch)
+            .zip(inflight_permits_for_batch)
+        {
+            spawn_concurrent_settlement_worker(SettlementWorkerArgs {
+                state: state.clone(),
+                fill,
+                tx_gate: tx_gate.clone(),
+                apply_gate: apply_gate.clone(),
+                receipt_permits: receipt_permits.clone(),
+                user_locks: user_locks.clone(),
+                reorder_state: reorder_state.clone(),
+                claim_generation,
+                worker_permit,
+                inflight_permit,
+            });
+        }
+    }
+}
+
+struct SettlementWorkerArgs {
+    state: AppState,
+    fill: FillCandidate,
+    tx_gate: Arc<OrderedGate>,
+    apply_gate: Arc<OrderedGate>,
+    receipt_permits: Arc<Semaphore>,
+    user_locks: Arc<UserSettlementLocks>,
+    reorder_state: Arc<PreSubmitReorderState>,
+    claim_generation: u64,
+    worker_permit: OwnedSemaphorePermit,
+    inflight_permit: OwnedSemaphorePermit,
+}
+
+fn spawn_concurrent_settlement_worker(args: SettlementWorkerArgs) {
+    tokio::spawn(async move {
+        let _worker_permit = args.worker_permit;
+        let _inflight_permit = args.inflight_permit;
+        let _user_guard = args
+            .user_locks
+            .lock_pair(args.fill.buyer, args.fill.seller)
+            .await;
+
+        let precheck = precheck_fill_for_concurrent_submit(&args.state, &args.fill).await;
+
+        let tx_turn = args.tx_gate.wait_for_turn(args.fill.seq).await;
+        if args
+            .reorder_state
+            .invalidates(args.claim_generation, args.fill.seq)
+        {
+            let mut engine = args.state.engine.lock().await;
+            engine.abort_fill(&args.fill, false, false);
+            drop(engine);
+            args.reorder_state.record_event(args.fill.seq);
+            drop(tx_turn);
+            args.apply_gate.complete(args.fill.seq);
+            return;
+        }
+        if finalize_concurrent_pre_submit(&args.state, &args.fill, precheck).await
+            == PreSubmitDecision::Abort
+        {
+            args.reorder_state.record_event(args.fill.seq);
+            drop(tx_turn);
+            args.apply_gate.complete(args.fill.seq);
+            return;
+        }
+
+        let submit_outcome = submit_settlement_once(&args.state, &args.fill).await;
+        drop(tx_turn);
+
+        match submit_outcome {
+            SubmitOutcome::SendFailed => {
+                args.reorder_state.record_event(args.fill.seq);
+                args.apply_gate.complete(args.fill.seq);
+            }
+            SubmitOutcome::Submitted(pending) => {
+                let _receipt_permit = args
+                    .receipt_permits
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("settlement receipt semaphore should not close");
+                confirm_and_apply_settlement(
+                    args.state,
+                    args.fill,
+                    pending,
+                    Some(args.apply_gate),
+                    PostSubmitFailurePolicy::StaleBothOrders,
+                )
+                .await;
+            }
+        }
+    });
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConcurrentPreSubmitCheck {
+    Ready,
+    RefreshFailed,
+    NotPending,
+    Underfunded,
+}
+
+async fn precheck_fill_for_concurrent_submit(
+    state: &AppState,
+    fill: &FillCandidate,
+) -> ConcurrentPreSubmitCheck {
+    {
+        let mut engine = state.engine.lock().await;
+        if !engine.fill_still_pending(fill) {
+            return ConcurrentPreSubmitCheck::NotPending;
+        }
+        engine.record_settlement_attempted();
+    }
+
+    if let Err(err) = refresh_for_settlement(state, fill).await {
+        eprintln!(
+            "[settlement] refresh failed seq={} buy={} sell={} price={} size={}: {err:#}",
+            fill.seq, fill.buyer, fill.seller, fill.exec_price, fill.fill_size
+        );
+        return ConcurrentPreSubmitCheck::RefreshFailed;
+    }
+
+    let engine = state.engine.lock().await;
+    if !engine.fill_still_pending(fill) {
+        return ConcurrentPreSubmitCheck::NotPending;
+    }
+    let (buyer_ok, seller_ok) = engine.users_funded_for_reserved(fill);
+    if !buyer_ok || !seller_ok {
+        return ConcurrentPreSubmitCheck::Underfunded;
+    }
+
+    ConcurrentPreSubmitCheck::Ready
+}
+
+async fn finalize_concurrent_pre_submit(
+    state: &AppState,
+    fill: &FillCandidate,
+    precheck: ConcurrentPreSubmitCheck,
+) -> PreSubmitDecision {
+    match precheck {
+        ConcurrentPreSubmitCheck::NotPending => return PreSubmitDecision::Abort,
+        ConcurrentPreSubmitCheck::RefreshFailed => {
+            let mut engine = state.engine.lock().await;
+            engine.record_settlement_precheck_failed();
+            engine.mark_dirty(fill.buyer);
+            engine.mark_dirty(fill.seller);
+            engine.abort_fill(fill, false, false);
+            return PreSubmitDecision::Abort;
+        }
+        ConcurrentPreSubmitCheck::Ready | ConcurrentPreSubmitCheck::Underfunded => {}
+    }
+
+    let mut engine = state.engine.lock().await;
+    if !engine.fill_still_pending(fill) {
+        return PreSubmitDecision::Abort;
+    }
+    let (buyer_ok, seller_ok) = engine.prune_underfunded_fill_users(fill);
+    if !buyer_ok || !seller_ok {
+        engine.record_settlement_precheck_failed();
+        engine.abort_fill(fill, !buyer_ok, !seller_ok);
+        return PreSubmitDecision::Abort;
+    }
+    engine.record_settlement_tx_attempt();
+    PreSubmitDecision::Submit
+}

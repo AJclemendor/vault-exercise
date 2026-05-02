@@ -1,0 +1,89 @@
+use alloy::primitives::Address;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+
+#[derive(Debug)]
+pub(super) struct PreSubmitReorderState {
+    generation: AtomicU64,
+    events: std::sync::Mutex<Vec<(u64, u64)>>,
+}
+
+impl PreSubmitReorderState {
+    pub(super) fn new() -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            events: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    pub(super) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn record_event(&self, seq: u64) {
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.events
+            .lock()
+            .expect("pre-submit reorder state poisoned")
+            .push((generation, seq));
+    }
+
+    pub(super) fn invalidates(&self, claim_generation: u64, fill_seq: u64) -> bool {
+        self.events
+            .lock()
+            .expect("pre-submit reorder state poisoned")
+            .iter()
+            .any(|(generation, seq)| *generation > claim_generation && *seq < fill_seq)
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct UserSettlementLocks {
+    stripes: Vec<Arc<AsyncMutex<()>>>,
+}
+
+impl UserSettlementLocks {
+    pub(super) fn new(stripes: usize) -> Self {
+        Self {
+            stripes: (0..stripes)
+                .map(|_| Arc::new(AsyncMutex::new(())))
+                .collect(),
+        }
+    }
+
+    pub(super) async fn lock_pair(&self, first: Address, second: Address) -> UserSettlementGuard {
+        let first_index = self.stripe_index(first);
+        let second_index = self.stripe_index(second);
+        if first_index == second_index {
+            return UserSettlementGuard {
+                _first: self.stripes[first_index].clone().lock_owned().await,
+                _second: None,
+            };
+        }
+
+        let (lower, upper) = if first_index < second_index {
+            (first_index, second_index)
+        } else {
+            (second_index, first_index)
+        };
+        let first_guard = self.stripes[lower].clone().lock_owned().await;
+        let second_guard = self.stripes[upper].clone().lock_owned().await;
+        UserSettlementGuard {
+            _first: first_guard,
+            _second: Some(second_guard),
+        }
+    }
+
+    fn stripe_index(&self, user: Address) -> usize {
+        user.as_slice().iter().fold(0usize, |acc, byte| {
+            acc.wrapping_mul(31) ^ usize::from(*byte)
+        }) % self.stripes.len()
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct UserSettlementGuard {
+    _first: OwnedMutexGuard<()>,
+    _second: Option<OwnedMutexGuard<()>>,
+}

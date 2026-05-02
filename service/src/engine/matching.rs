@@ -9,6 +9,21 @@ use super::math::{min_u256, reservation_for, sub_or_zero};
 use super::{Engine, FillCandidate, Order};
 
 impl Engine {
+    pub(crate) fn claim_next_fill_candidate(&mut self) -> Option<FillCandidate> {
+        self.next_fill_candidate()
+    }
+
+    pub(crate) fn claim_fill_batch(&mut self, max: usize) -> Vec<FillCandidate> {
+        let mut fills = Vec::new();
+        while fills.len() < max {
+            let Some(fill) = self.claim_next_fill_candidate() else {
+                break;
+            };
+            fills.push(fill);
+        }
+        fills
+    }
+
     pub(crate) fn next_fill_candidate(&mut self) -> Option<FillCandidate> {
         loop {
             if let Some(market_id) = self.oldest_market_order() {
