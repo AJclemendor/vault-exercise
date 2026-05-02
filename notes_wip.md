@@ -1,14 +1,78 @@
 # GPT was used for formatting and light copy editing; the substance is otherwise written by me
-
-
-Here are metrics for a 10 min run
-
-
-
 - Small note as I am not very familiar with Rust: I made a point to keep non-test files under `service/src` below 500 lines.
 The dedicated test files are larger, and production modules only include small `#[cfg(test)]` hooks to point at those test files. This helped me review the implementation line by line and understand the generated output.
-
 Also, my eyesight is lowkey dying, so I tend to log some things with color and formatting because it makes runtime output easier for me to scan.
+
+ ^ if you run the run.sh script you will see what I mean
+
+Here are metrics for an 8 min run
+## First Interval Run
+
+### First Stats Snapshot
+
+| Metric | Value |
+|---|---:|
+| Orders received | 597 |
+| Orders accepted | 475 / 597 (79.6%) |
+| Orders rejected | 122 / 597 (20.4%) |
+| Admission failures | 122 |
+| Bad request | 0 |
+| Insufficient balance | 122 |
+| Stale cache | 0 |
+| Refresh failures | 0 |
+| Orders matched | 230 / 475 (48.4%) |
+| Fill-side events | 372 |
+| Fill candidates | 199 |
+| Settlements attempted | 199 / 199 (100.0%) |
+| Precheck passed | 199 / 199 (100.0%) |
+| Precheck failed | 0 / 199 (0.0%) |
+| Tx attempts | 199 / 199 (100.0%) |
+| Tx submitted | 199 / 199 (100.0%) |
+| Settlements reverted | 0 |
+| Success | 186 |
+| Pending | 13 |
+| Currently open orders | 242 |
+| Open status | 214 |
+| Partial status | 28 |
+| Lifetime accepted pct | 50.9% |
+
+### Final Stats Snapshot
+
+| Metric | Value |
+|---|---:|
+| Orders received | 26,104 |
+| Orders accepted | 22,423 / 26,104 (85.9%) |
+| Orders rejected | 3,681 / 26,104 (14.1%) |
+| Admission failures | 3,681 |
+| Bad request | 0 |
+| Insufficient balance | 3,677 |
+| Stale cache | 4 |
+| Refresh failures | 0 |
+| Orders matched | 10,414 / 22,423 (46.4%) |
+| Fill-side events | 19,234 |
+| Fill candidates | 9,717 |
+| Settlements attempted | 9,698 / 9,717 (99.8%) |
+| Precheck passed | 9,695 / 9,698 (100.0%) |
+| Precheck failed | 3 / 9,698 (0.0%) |
+| Tx attempts | 9,695 / 9,695 (100.0%) |
+| Tx submitted | 9,695 / 9,695 (100.0%) |
+| Settlements reverted | 17 / 9,695 (0.2%) |
+| Success | 9,617 |
+| Pending | 61 |
+| Unattempted | 19 |
+| Currently open orders | 579 |
+| Open status | 569 |
+| Partial status | 10 |
+| Lifetime accepted pct | 2.6% |
+
+The harness intentionally makes 25% of submitted orders oversized at `1.5x-3x` the user’s EOA balance. But “oversized” is based on raw size, while buy admission is based on notional. So a buy with `2x` balance in size at a `0.40` price only requires `0.8x` balance and can validly pass.
+
+The larger tradeoff is that resting limit orders are only required to be individually affordable against real balance minus hard locks. We do not hard-lock the full notional for every open limit order, so users can quote more liquidity than they could settle all at once. That makes the book deeper and more flexible, but it also means some resting orders may become stale after fills or balance changes.
+
+Hard-locking every limit order would improve safety and book quality, but it would also reject more orders and make the market thinner. In a very liquid market, stricter hard locks may make sense. Here, we are deliberately trading some safety and occasional book quality for better available liquidity.
+
+
+
 
 
 # Repo Struct
@@ -59,69 +123,30 @@ This summarizes the visible Rust service structure under `service/src`.
 # Verified against current app implementation
 # Logic design choices 
 
-- I honestly think I could make a strong argument for both sides of these choices so I will do my best to explain why I chose the ones I did and why I think for this the tradeoffs are worth it.
+- I honestly think I could make a strong argument for both sides of a lot of these choices so I will do my best to explain why I chose the ones I did and why I think for this the tradeoffs are worth it.
 
 
 # Harness edits
-The harness changes are mostly connection-pooling / runtime-control changes. They do not change the service HTTP API shape, but they do change harness-internal function signatures so shared clients can be passed through setup, provider/reader creation, order loops, and chain loops.
 
-The upstream harness created new HTTP/RPC connections more aggressively. This branch adds shared clients so the harness can run higher concurrency without timing out from too many individual connections.
-
-A new `HarnessClients` struct was added with two reusable clients:
-
-- `service: reqwest::Client`
-- `rpc: alloy::transports::http::reqwest::Client`
-
-Both clients are built with a 5 second timeout and a larger idle connection pool.
+The harness changes are limited to connection pooling and runtime control; they do not change the service HTTP API. The upstream harness created HTTP and RPC connections too aggressively under concurrency, which could cause runner crashes or timeouts from too many individual connections. To fix that, the harness now uses a shared `HarnessClients` struct with reusable `service: reqwest::Client` and `rpc: alloy::transports::http::reqwest::Client` clients, both configured with a 5 second timeout and a larger idle connection pool so setup, provider/reader creation, order loops, and chain loops can run higher concurrency more reliably.
 
 
 
+# Ghost Orders And Limitations
 
-# Ghost orders and what is still weak
 
-A ghost order is an order that matches off-chain and when there is a match but the match cannot actually settle on-chain.
+A ghost order is an order that matches off-chain but cannot settle on-chain. This happens because the service only has a snapshot of user balances. A user can have enough balance when an order is admitted, then transfer funds or withdraw from the vault before Vault.matchOrders(...) lands, causing the settlement transaction to revert.
 
-This can happen because the service's off-chain view of balances is only a snapshot. A user may have enough balance when we admit the order, but before settlement they can transfer tokens, withdraw from the vault, or otherwise change their on-chain state. Then when the service calls `Vault.matchOrders(...)`, the contract tries to pull funds and the transaction can revert.
+The service reduces this risk in several ways: it refreshes stale balances before admission, sequences admission before checking freshness, refreshes users with reserved balances in the background, marks users dirty from chain logs, refreshes buyer and seller balances again before settlement, skips transaction submission when a fill is already underfunded, and handles reverts by refreshing, pruning, releasing, or staling affected orders. If a transaction hash exists but the receipt outcome is unknown, the fill stays locked while the service rechecks; after a bounded timeout, both orders are staled and reservations are released.
 
-The repo tries to reduce ghost orders in a few ways:
+The main unsolved weakness is that the pre-settlement refresh is not atomic with the on-chain transaction. A user can still move funds after the refresh but before settlement. That cannot be fully solved off-chain. A production system would likely need escrow or on-chain reservation before matching.
 
-1. Admission refreshes stale balances before accepting new orders.
-2. Admission waits for the request's admission turn before checking freshness, and the engine still rejects admission if the cache remains dirty or missing.
-3. Users with reserved balances are refreshed in the background.
-4. Chain logs mark known users dirty when transfers, matches, or withdrawals happen.
-5. Settlement always does a pre-settlement refresh for both buyer and seller before submitting `Vault.matchOrders(...)`.
-6. If a fill is underfunded before settlement, the service does not submit the transaction.
-7. If settlement reverts, the service refreshes again, records the revert, and either releases, prunes, or stales the affected fill/orders depending on policy and post-revert funding. Users are marked dirty if the post-revert refresh fails.
-8. If the service has a tx hash but cannot prove success or revert, it keeps the fill locked while rechecking. This is now bounded: after the deferred receipt checks time out, the service marks both users dirty, stales both orders, aborts the fill, and releases the reservations.
+Remaining tradeoffs: resting limit orders can overbook balance, which improves liquidity but can leave stale book liquidity after fills or balance changes. Balance freshness still depends on cache age, log polling, and dirty flags. Send failures without a transaction hash are handled conservatively but not durably tracked. The settlement queue and order state are in-memory, so process restarts lose queued and in-flight work. Receipt timeouts prevent funds from staying locked forever, but a late-successful transaction after timeout would require later reconciliation.
 
-The biggest remaining weakness is that the pre-settlement refresh is not atomic with the on-chain transaction. A user can have enough balance when we check, then move funds before `Vault.matchOrders(...)` lands. I do not think this can be fully solved off-chain. The clean solution would be an on-chain reservation or escrow model, where funds are locked before orders are allowed to match. A direct socket-style connection to the user's wallet could maybe reduce the window, but it adds a lot of overhead and still seems weaker than holding funds on-platform in some way. Without that, the service can only detect the failure and handle the revert.
+In production, I would persist orders, reservations, fills, submitted tx hashes, receipt outcomes, balance-read block numbers, and dirty-user block numbers in a database, then make settlement workers resume only from that durable state. Before settlement, the worker would refresh balances and record the block; after submitting, it would store the tx hash/nonce before waiting for a receipt. Chain log events would mark users dirty at specific blocks, and a balance refresh would only clear dirty state if it was read at or after that block. After a restart, the service could safely reconstruct live orders, locked funds, pending settlements, and users that need refresh instead of relying on in-memory state.
 
-Other weak spots:
 
-# Ghost Order Limitations
-
-The service reduces ghost orders, but it does not eliminate them completely. It refreshes stale or dirty balance caches before admission, refreshes buyer/seller balances again before settlement, catches many underfunded fills before tx submission, keeps unresolved submitted fills locked at the order/reservation level while receipt checks run, and has a bounded cleanup path when the final receipt cannot be proven.
-
-## Remaining Tradeoffs
-
-- **Resting limit orders can overbook balance.** A user can have multiple open limit orders that are each valid alone, but cannot all settle together. This gives the book more flexibility, but it means some resting liquidity can become stale once one order fills or the user's chain balance changes.
-
-- **Balance freshness is still a cache policy.** Live balance reads are now tied to block numbers, and dirty log events carry block ordering so an older refresh should not clear a newer dirty mark. This is safer than wall-clock-only freshness, but the service still depends on polling, cache age thresholds, and log processing latency.
-
-- **Send failures without a tx hash are handled conservatively but are not durably tracked.** The service records a send failure, marks both users dirty, and stales both orders because it cannot prove whether the provider broadcasted the tx before failing. Production would still want durable nonce or transaction tracking around this edge case.
-
-- **The settlement queue is in-memory and unbounded.** Under heavy load it can grow, and a process restart loses queued work plus local in-flight state.
-
-- **There is no durable order or settlement persistence.** This is acceptable for the exercise, but production would need durable recovery for open orders, in-flight txs, user reservations, and unknown receipt outcomes.
-
-- **The receipt timeout is bounded by design.** Bounded timeout prevents reservations from staying locked forever. The tradeoff is that if an unknown tx succeeds after the service gives up, the service releases local reservations, stales both orders, and marks both users dirty. Any later repair depends on a future admission-triggered refresh or explicit chain read; there is no durable automatic recovery.
-
-## Production Direction
-
-For a production version, the core improvement would be to make the off-chain view durable and provably ordered against chain state. That means persisting orders, reservations, submitted tx hashes/metadata, nonce decisions if managed by the service, receipt status, balance-read block numbers, dirty-after-block markers, and any in-memory ordering/reorder generations. A settlement worker should be able to restart, replay pending work, and prove whether a prefetched balance is still valid when its turn arrives.
-
-The current design is a reasonable exercise-level compromise: it uses conservative pre-settlement checks, block-versioned balance refreshes, dirty marking from logs, and bounded unknown-outcome handling, but it still accepts that ghost orders can happen under adversarial chain activity.
-
+Essentially if this crashes right now you are fucked, if it crashes in prod env you need to be able to fully replay // restore the entire state
 
 
 
