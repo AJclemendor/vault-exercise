@@ -151,7 +151,7 @@ impl Engine {
         let mut orders: Vec<_> = self
             .orders
             .values()
-            .filter(|order| order.is_live())
+            .filter(|order| order.is_visible_open())
             .filter(|order| user.map(|u| order.user == u).unwrap_or(true))
             .collect();
         orders.sort_by_key(|order| order.created_seq);

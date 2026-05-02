@@ -141,6 +141,8 @@ fn market_order_matches_older_resting_limit_from_indexed_book() {
     assert_eq!(fill.buy_id, market_id);
     assert_eq!(fill.sell_id, sell_id);
     assert_eq!(fill.quote, wad(8));
+    assert!(engine.open_orders(Some(buyer)).is_empty());
+    assert_eq!(engine.stats_snapshot().currently_open_market_ioc_orders, 0);
 }
 
 #[test]

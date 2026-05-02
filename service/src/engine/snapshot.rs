@@ -7,11 +7,17 @@ use super::Engine;
 
 impl Engine {
     pub(crate) fn stats_snapshot(&self) -> StatsSnapshot {
-        let live_orders = self.orders.values().filter(|order| order.is_live()).count();
+        let live_orders = self
+            .orders
+            .values()
+            .filter(|order| order.is_visible_open())
+            .count();
         let open_market_ioc_orders = self
             .orders
             .values()
-            .filter(|order| order.is_live() && order.order_type == OrderType::Market)
+            .filter(|order| {
+                order.is_live() && order.order_type == OrderType::Market && !order.cancel_requested
+            })
             .count();
         let market_ioc_orders_accepted = self
             .orders

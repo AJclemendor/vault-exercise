@@ -81,6 +81,10 @@ impl Order {
         ) && self.total_remaining() > U256::ZERO
     }
 
+    fn is_visible_open(&self) -> bool {
+        self.is_live() && !(self.order_type == OrderType::Market && self.cancel_requested)
+    }
+
     fn total_remaining(&self) -> U256 {
         math::sub_or_zero(self.size, self.filled_size)
     }
