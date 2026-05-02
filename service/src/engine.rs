@@ -5,7 +5,7 @@ use crate::types::{
 };
 use alloy::primitives::{Address, U256};
 use std::cmp::{Ordering, Reverse};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 const WAD: u128 = 1_000_000_000_000_000_000;
@@ -19,7 +19,6 @@ struct BalanceState {
     vault: U256,
     dirty: bool,
     last_refresh: Option<Instant>,
-    last_activity: Instant,
 }
 
 impl Default for BalanceState {
@@ -30,7 +29,6 @@ impl Default for BalanceState {
             vault: U256::ZERO,
             dirty: true,
             last_refresh: None,
-            last_activity: Instant::now(),
         }
     }
 }
@@ -88,6 +86,8 @@ impl Order {
 #[derive(Debug)]
 pub(crate) struct Engine {
     orders: HashMap<String, Order>,
+    bids: BTreeMap<U256, VecDeque<String>>,
+    asks: BTreeMap<U256, VecDeque<String>>,
     balances: HashMap<Address, BalanceState>,
     next_order_seq: u64,
     next_fill_seq: u64,
@@ -98,6 +98,8 @@ impl Engine {
     pub(crate) fn new() -> Self {
         Self {
             orders: HashMap::new(),
+            bids: BTreeMap::new(),
+            asks: BTreeMap::new(),
             balances: HashMap::new(),
             next_order_seq: 1,
             next_fill_seq: 1,
@@ -154,7 +156,6 @@ impl Engine {
             ));
         };
         let balance = self.balances.entry(request.user).or_default();
-        balance.last_activity = Instant::now();
 
         if balance.dirty || balance.last_refresh.is_none() {
             self.record_order_rejected_stale_balance_cache();
@@ -189,6 +190,9 @@ impl Engine {
             matched_once: false,
         };
         self.next_order_seq += 1;
+        if order.order_type == OrderType::Limit {
+            self.index_limit_order(order.side, order.price, id.clone());
+        }
         self.orders.insert(id.clone(), order);
         self.stats.orders_accepted += 1;
 
@@ -224,15 +228,26 @@ impl Engine {
                 real: U256::ZERO,
                 reserved: U256::ZERO,
                 virtual_: U256::ZERO,
+                deficit: U256::ZERO,
+                over_reserved: false,
                 vault: U256::ZERO,
+                stale: true,
+                last_refresh_age_ms: None,
             };
         };
 
+        let deficit = sub_or_zero(balance.reserved, balance.real);
         BalanceView {
             real: balance.real,
             reserved: balance.reserved,
             virtual_: sub_or_zero(balance.real, balance.reserved),
+            deficit,
+            over_reserved: deficit > U256::ZERO,
             vault: balance.vault,
+            stale: balance.dirty || balance.last_refresh.is_none(),
+            last_refresh_age_ms: balance
+                .last_refresh
+                .map(|last| last.elapsed().as_millis() as u64),
         }
     }
 
@@ -242,42 +257,15 @@ impl Engine {
             .values()
             .filter(|order| order.is_live())
             .filter(|order| user.map(|u| order.user == u).unwrap_or(true))
-            .map(Order::view)
             .collect();
-        orders.sort_by_key(|order| order.id.clone());
-        orders
+        orders.sort_by_key(|order| order.created_seq);
+        orders.into_iter().map(Order::view).collect()
     }
 
     pub(crate) fn book_snapshot(&self, depth: usize) -> BookSnapshot {
         let depth = depth.clamp(1, 100);
-        let mut bids: BTreeMap<U256, (U256, usize)> = BTreeMap::new();
-        let mut asks: BTreeMap<U256, (U256, usize)> = BTreeMap::new();
-
-        for order in self.orders.values().filter(|order| {
-            order.is_live()
-                && order.order_type == OrderType::Limit
-                && order.available_remaining() > U256::ZERO
-        }) {
-            let levels = match order.side {
-                Side::Buy => &mut bids,
-                Side::Sell => &mut asks,
-            };
-            let entry = levels.entry(order.price).or_insert((U256::ZERO, 0));
-            entry.0 += order.available_remaining();
-            entry.1 += 1;
-        }
-
-        let bid_levels: Vec<_> = bids
-            .iter()
-            .rev()
-            .take(depth)
-            .map(|(price, (size, orders))| book_level(*price, *size, *orders))
-            .collect();
-        let ask_levels: Vec<_> = asks
-            .iter()
-            .take(depth)
-            .map(|(price, (size, orders))| book_level(*price, *size, *orders))
-            .collect();
+        let bid_levels = self.book_levels(Side::Buy, depth);
+        let ask_levels = self.book_levels(Side::Sell, depth);
 
         let best_bid_raw = bid_levels.first().map(|level| level.price_raw);
         let best_ask_raw = ask_levels.first().map(|level| level.price_raw);
@@ -305,8 +293,71 @@ impl Engine {
         }
     }
 
+    fn book_levels(&self, side: Side, depth: usize) -> Vec<BookLevel> {
+        let prices: Vec<_> = match side {
+            Side::Buy => self.bids.keys().rev().copied().collect(),
+            Side::Sell => self.asks.keys().copied().collect(),
+        };
+        let book = match side {
+            Side::Buy => &self.bids,
+            Side::Sell => &self.asks,
+        };
+        let mut levels = Vec::with_capacity(depth);
+
+        for price in prices {
+            let Some(queue) = book.get(&price) else {
+                continue;
+            };
+            let mut size = U256::ZERO;
+            let mut orders = 0;
+
+            for order_id in queue {
+                let Some(order) = self.orders.get(order_id) else {
+                    continue;
+                };
+                if order.side == side
+                    && order.price == price
+                    && order.order_type == OrderType::Limit
+                    && order.is_live()
+                    && order.available_remaining() > U256::ZERO
+                {
+                    size += order.available_remaining();
+                    orders += 1;
+                }
+            }
+
+            if orders > 0 {
+                levels.push(book_level(price, size, orders));
+                if levels.len() == depth {
+                    break;
+                }
+            }
+        }
+
+        levels
+    }
+
     pub(crate) fn stats_snapshot(&self) -> StatsSnapshot {
         let live_orders = self.orders.values().filter(|order| order.is_live()).count();
+        let open_market_ioc_orders = self
+            .orders
+            .values()
+            .filter(|order| order.is_live() && order.order_type == OrderType::Market)
+            .count();
+        let market_ioc_orders_accepted = self
+            .orders
+            .values()
+            .filter(|order| order.order_type == OrderType::Market)
+            .count() as u64;
+        let market_ioc_orders_cancelled_unfilled = self
+            .orders
+            .values()
+            .filter(|order| {
+                order.order_type == OrderType::Market
+                    && order.status == OrderStatus::Cancelled
+                    && order.filled_size.is_zero()
+            })
+            .count();
         let open_status_orders = self
             .orders
             .values()
@@ -344,6 +395,14 @@ impl Engine {
         } else {
             (active_cache_ages.iter().sum::<u128>() / active_cache_ages.len() as u128) as u64
         };
+        let orders_admission_failures = self.stats.orders_rejected_bad_request
+            + self.stats.orders_rejected_insufficient_balance
+            + self.stats.orders_rejected_stale_balance_cache
+            + self.stats.orders_failed_balance_refresh;
+        let settlement_tx_failures = self.stats.settlement_send_failures
+            + self.stats.settlement_receipt_failures
+            + self.stats.settlements_reverted;
+        let settlement_failures = self.stats.settlements_precheck_failed + settlement_tx_failures;
 
         StatsSnapshot {
             orders_received: self.stats.orders_received,
@@ -351,6 +410,11 @@ impl Engine {
             orders_accepted_pct: pct(self.stats.orders_accepted, self.stats.orders_received),
             orders_rejected: self.stats.orders_rejected,
             orders_rejected_pct: pct(self.stats.orders_rejected, self.stats.orders_received),
+            orders_admission_failures,
+            orders_admission_failures_pct: pct(
+                orders_admission_failures,
+                self.stats.orders_received,
+            ),
             orders_rejected_bad_request: self.stats.orders_rejected_bad_request,
             orders_rejected_bad_request_pct: pct(
                 self.stats.orders_rejected_bad_request,
@@ -371,17 +435,35 @@ impl Engine {
                 self.stats.orders_failed_balance_refresh,
                 self.stats.orders_received,
             ),
-            orders_matched: self.stats.orders_matched,
-            orders_with_successful_fill: self.stats.orders_matched,
+            orders_matched: self.stats.order_sides_filled,
+            orders_with_successful_fill: self.stats.unique_orders_with_successful_fill,
+            unique_orders_with_successful_fill: self.stats.unique_orders_with_successful_fill,
             order_sides_filled: self.stats.order_sides_filled,
+            fill_sides_successfully_settled: self.stats.order_sides_filled,
+            market_ioc_orders_accepted,
+            market_ioc_orders_cancelled_unfilled,
+            currently_open_market_ioc_orders: open_market_ioc_orders,
             fill_candidates: self.stats.fill_candidates,
             orders_matched_pct_of_accepted: pct(
-                self.stats.orders_matched,
+                self.stats.order_sides_filled,
+                self.stats.orders_accepted,
+            ),
+            unique_orders_with_successful_fill_pct_of_accepted: pct(
+                self.stats.unique_orders_with_successful_fill,
                 self.stats.orders_accepted,
             ),
             settlements_attempted: self.stats.settlements_attempted,
+            settlement_precheck_attempts: self.stats.settlements_attempted,
             settlement_tx_attempts: self.stats.settlement_tx_attempts,
+            settlement_failures,
+            settlement_failures_pct: pct(settlement_failures, self.stats.settlements_attempted),
+            settlement_tx_failures,
+            settlement_tx_failures_pct: pct(
+                settlement_tx_failures,
+                self.stats.settlement_tx_attempts,
+            ),
             settlements_precheck_failed: self.stats.settlements_precheck_failed,
+            settlement_precheck_failures: self.stats.settlements_precheck_failed,
             settlements_precheck_failed_pct: pct(
                 self.stats.settlements_precheck_failed,
                 self.stats.settlements_attempted,
@@ -397,7 +479,10 @@ impl Engine {
                 self.stats.settlement_tx_attempts,
             ),
             settlements_reverted: self.stats.settlements_reverted,
-            settlement_receipt_reverts: self.stats.settlements_reverted,
+            settlement_reverts: self.stats.settlements_reverted,
+            settlement_receipt_status_reverted: self.stats.settlements_reverted,
+            settlement_tx_reverts: self.stats.settlements_reverted,
+            settlement_unknown_outcomes: self.stats.settlement_unknown_outcomes,
             settlements_reverted_pct: pct(
                 self.stats.settlements_reverted,
                 self.stats.settlement_tx_attempts,
@@ -427,6 +512,7 @@ impl Engine {
             ),
             successful_settlements: self.stats.successful_settlements,
             fills_settled: self.stats.successful_settlements,
+            fills_successfully_settled: self.stats.successful_settlements,
             successful_settlements_pct: pct(
                 self.stats.successful_settlements,
                 self.stats.settlements_attempted,
@@ -501,6 +587,10 @@ impl Engine {
         self.stats.settlement_receipt_failures += 1;
     }
 
+    pub(crate) fn record_settlement_unknown_outcome(&mut self) {
+        self.stats.settlement_unknown_outcomes += 1;
+    }
+
     pub(crate) fn record_pre_settlement_balance_refreshes(&mut self, count: u64) {
         self.stats.pre_settlement_balance_refreshes += count;
     }
@@ -559,6 +649,8 @@ impl Engine {
                     return self.prepare_fill(&market_id, &counterparty_id);
                 }
 
+                // Market orders are background IOC: they never appear in book
+                // depth and are cancelled when no older resting limit can fill.
                 self.terminal_order(&market_id, OrderStatus::Cancelled);
                 continue;
             }
@@ -576,75 +668,131 @@ impl Engine {
             .map(|order| order.id.clone())
     }
 
-    fn find_market_counterparty(&self, market_id: &str) -> Option<String> {
-        let market = self.orders.get(market_id)?;
+    fn find_market_counterparty(&mut self, market_id: &str) -> Option<String> {
+        let market = self.orders.get(market_id)?.clone();
 
-        match market.side {
+        let prices: Vec<_> = match market.side {
             Side::Buy => self
-                .orders
-                .values()
-                .filter(|order| {
-                    order.is_live()
-                        && order.order_type == OrderType::Limit
-                        && order.side == Side::Sell
-                        && order.user != market.user
-                        && order.created_seq < market.created_seq
-                        && order.is_available_for_fill()
-                        && order.price <= market.price
-                })
-                .min_by(|a, b| match a.price.cmp(&b.price) {
-                    Ordering::Equal => a.created_seq.cmp(&b.created_seq),
-                    ordering => ordering,
-                })
-                .map(|order| order.id.clone()),
+                .asks
+                .range(..=market.price)
+                .map(|(price, _)| *price)
+                .collect(),
             Side::Sell => self
-                .orders
-                .values()
-                .filter(|order| {
-                    order.is_live()
-                        && order.order_type == OrderType::Limit
-                        && order.side == Side::Buy
-                        && order.user != market.user
-                        && order.created_seq < market.created_seq
-                        && order.is_available_for_fill()
-                        && order.price >= market.price
-                })
-                .max_by(|a, b| match a.price.cmp(&b.price) {
-                    Ordering::Equal => b.created_seq.cmp(&a.created_seq),
-                    ordering => ordering,
-                })
-                .map(|order| order.id.clone()),
-        }
-    }
+                .bids
+                .range(market.price..)
+                .rev()
+                .map(|(price, _)| *price)
+                .collect(),
+        };
+        let counterparty_side = match market.side {
+            Side::Buy => Side::Sell,
+            Side::Sell => Side::Buy,
+        };
 
-    fn best_crossing_limits(&self) -> Option<(String, String)> {
-        let mut best: Option<(&Order, &Order)> = None;
-
-        for buy in self.orders.values().filter(|order| {
-            order.is_available_for_fill()
-                && order.order_type == OrderType::Limit
-                && order.side == Side::Buy
-        }) {
-            for sell in self.orders.values().filter(|order| {
-                order.is_available_for_fill()
-                    && order.order_type == OrderType::Limit
-                    && order.side == Side::Sell
-                    && order.user != buy.user
-                    && buy.price >= order.price
-            }) {
-                let replace = match best {
-                    None => true,
-                    Some((best_buy, best_sell)) => {
-                        limit_pair_priority((buy, sell), (best_buy, best_sell)) == Ordering::Less
-                    }
+        for price in prices {
+            for order_id in self.available_limit_ids_at_price(counterparty_side, price) {
+                let Some(order) = self.orders.get(&order_id) else {
+                    continue;
                 };
-                if replace {
-                    best = Some((buy, sell));
+                if order.user != market.user && order.created_seq < market.created_seq {
+                    return Some(order_id);
                 }
             }
         }
 
-        best.map(|(buy, sell)| (buy.id.clone(), sell.id.clone()))
+        None
+    }
+
+    fn best_crossing_limits(&mut self) -> Option<(String, String)> {
+        let bid_prices: Vec<_> = self.bids.keys().rev().copied().collect();
+
+        for bid_price in bid_prices {
+            let buy_ids = self.available_limit_ids_at_price(Side::Buy, bid_price);
+            if buy_ids.is_empty() {
+                continue;
+            }
+
+            let ask_prices: Vec<_> = self
+                .asks
+                .range(..=bid_price)
+                .map(|(price, _)| *price)
+                .collect();
+            for ask_price in ask_prices {
+                let sell_ids = self.available_limit_ids_at_price(Side::Sell, ask_price);
+                if sell_ids.is_empty() {
+                    continue;
+                }
+
+                for buy_id in &buy_ids {
+                    let Some(buy_user) = self.orders.get(buy_id).map(|order| order.user) else {
+                        continue;
+                    };
+                    if let Some(sell_id) = sell_ids.iter().find(|sell_id| {
+                        self.orders
+                            .get(*sell_id)
+                            .map(|sell| sell.user != buy_user)
+                            .unwrap_or(false)
+                    }) {
+                        return Some((buy_id.clone(), sell_id.clone()));
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    fn index_limit_order(&mut self, side: Side, price: U256, order_id: String) {
+        let book = match side {
+            Side::Buy => &mut self.bids,
+            Side::Sell => &mut self.asks,
+        };
+        book.entry(price).or_default().push_back(order_id);
+    }
+
+    fn available_limit_ids_at_price(&mut self, side: Side, price: U256) -> Vec<String> {
+        self.clean_limit_level(side, price);
+
+        let book = match side {
+            Side::Buy => &self.bids,
+            Side::Sell => &self.asks,
+        };
+        let Some(queue) = book.get(&price) else {
+            return Vec::new();
+        };
+
+        queue
+            .iter()
+            .filter(|order_id| self.is_available_indexed_limit(order_id, side, price))
+            .cloned()
+            .collect()
+    }
+
+    fn clean_limit_level(&mut self, side: Side, price: U256) {
+        let book = match side {
+            Side::Buy => &mut self.bids,
+            Side::Sell => &mut self.asks,
+        };
+        let Some(queue) = book.get_mut(&price) else {
+            return;
+        };
+        let orders = &self.orders;
+        queue.retain(|order_id| should_keep_indexed_limit(orders, order_id, side, price));
+        if queue.is_empty() {
+            book.remove(&price);
+        }
+    }
+
+    fn is_available_indexed_limit(&self, order_id: &str, side: Side, price: U256) -> bool {
+        self.orders
+            .get(order_id)
+            .map(|order| {
+                order.side == side
+                    && order.price == price
+                    && order.order_type == OrderType::Limit
+                    && order.is_available_for_fill()
+            })
+            .unwrap_or(false)
     }
 
     fn prepare_fill(&mut self, first_id: &str, second_id: &str) -> Option<FillCandidate> {
@@ -716,28 +864,83 @@ impl Engine {
     }
 
     pub(crate) fn users_funded_for_reserved(&self, fill: &FillCandidate) -> (bool, bool) {
-        let buyer_ok = self
-            .balances
-            .get(&fill.buyer)
-            .map(|balance| balance.real >= balance.reserved)
-            .unwrap_or(false);
-        let seller_ok = self
-            .balances
-            .get(&fill.seller)
-            .map(|balance| balance.real >= balance.reserved)
-            .unwrap_or(false);
+        let buyer_ok = self.user_funded_for_fill(fill, fill.buyer);
+        let seller_ok = self.user_funded_for_fill(fill, fill.seller);
         (buyer_ok, seller_ok)
     }
 
     pub(crate) fn prune_underfunded_fill_users(&mut self, fill: &FillCandidate) -> (bool, bool) {
         let (buyer_ok, seller_ok) = self.users_funded_for_reserved(fill);
         if !buyer_ok {
-            self.prune_user_to_balance(fill.buyer, None);
+            self.prune_user_to_afford_fill(fill.buyer, fill);
         }
         if !seller_ok {
-            self.prune_user_to_balance(fill.seller, None);
+            self.prune_user_to_afford_fill(fill.seller, fill);
         }
         self.users_funded_for_reserved(fill)
+    }
+
+    fn user_funded_for_fill(&self, fill: &FillCandidate, user: Address) -> bool {
+        let Some(balance) = self.balances.get(&user) else {
+            return false;
+        };
+        self.required_balance_after_fill_for_user(fill, user)
+            .map(|required| balance.real >= required)
+            .unwrap_or(false)
+    }
+
+    fn required_balance_after_fill_for_user(
+        &self,
+        fill: &FillCandidate,
+        user: Address,
+    ) -> Option<U256> {
+        let balance = self.balances.get(&user)?;
+        let mut required = balance.reserved;
+
+        if fill.buyer == user {
+            required = self.required_balance_after_order_fill(
+                required,
+                &fill.buy_id,
+                fill.fill_size,
+                fill.quote,
+            )?;
+        }
+        if fill.seller == user {
+            required = self.required_balance_after_order_fill(
+                required,
+                &fill.sell_id,
+                fill.fill_size,
+                fill.base,
+            )?;
+        }
+
+        Some(required)
+    }
+
+    fn required_balance_after_order_fill(
+        &self,
+        reserved: U256,
+        order_id: &str,
+        fill_size: U256,
+        settlement_debit: U256,
+    ) -> Option<U256> {
+        let order = self.orders.get(order_id)?;
+        if order.in_flight_size < fill_size || order.total_remaining() < fill_size {
+            return None;
+        }
+
+        let old_required = reservation_for(order.side, order.price, order.total_remaining())?;
+        let post_fill_remaining = order.total_remaining() - fill_size;
+        let new_required = if post_fill_remaining.is_zero() {
+            U256::ZERO
+        } else {
+            reservation_for(order.side, order.price, post_fill_remaining)?
+        };
+
+        reserved
+            .checked_sub(old_required)?
+            .checked_add(new_required)?
+            .checked_add(settlement_debit)
     }
 
     pub(crate) fn apply_settlement_success(&mut self, fill: &FillCandidate) {
@@ -748,7 +951,7 @@ impl Engine {
         let matched_orders = self.apply_order_fill(&fill.buy_id, fill.fill_size) as u64
             + self.apply_order_fill(&fill.sell_id, fill.fill_size) as u64;
 
-        self.stats.orders_matched += matched_orders;
+        self.stats.unique_orders_with_successful_fill += matched_orders;
         self.stats.order_sides_filled += 2;
         self.stats.successful_settlements += 1;
     }
@@ -880,6 +1083,32 @@ impl Engine {
         }
     }
 
+    fn prune_user_to_afford_fill(&mut self, user: Address, fill: &FillCandidate) {
+        if self.user_funded_for_fill(fill, user) {
+            return;
+        }
+
+        let mut candidates: Vec<_> = self
+            .orders
+            .values()
+            .filter(|order| {
+                order.user == user
+                    && order.is_live()
+                    && order.in_flight_size.is_zero()
+                    && order.total_remaining() > U256::ZERO
+            })
+            .map(|order| (order.created_seq, order.id.clone()))
+            .collect();
+        candidates.sort_by_key(|candidate| Reverse(candidate.0));
+
+        for (_, order_id) in candidates {
+            self.terminal_order(&order_id, OrderStatus::Stale);
+            if self.user_funded_for_fill(fill, user) {
+                break;
+            }
+        }
+    }
+
     fn terminal_order(&mut self, order_id: &str, status: OrderStatus) {
         let Some(order_snapshot) = self.orders.get(order_id).cloned() else {
             return;
@@ -911,7 +1140,6 @@ impl Engine {
     fn release_user_reservation(&mut self, user: Address, amount: U256) {
         let balance = self.balances.entry(user).or_default();
         balance.reserved = sub_or_zero(balance.reserved, amount);
-        balance.last_activity = Instant::now();
     }
 }
 
@@ -997,6 +1225,23 @@ fn execution_price(buy: &Order, sell: &Order) -> U256 {
         _ if buy.created_seq > sell.created_seq => sell.price,
         _ => buy.price,
     }
+}
+
+fn should_keep_indexed_limit(
+    orders: &HashMap<String, Order>,
+    order_id: &str,
+    side: Side,
+    price: U256,
+) -> bool {
+    orders
+        .get(order_id)
+        .map(|order| {
+            order.side == side
+                && order.price == price
+                && order.order_type == OrderType::Limit
+                && order.is_live()
+        })
+        .unwrap_or(false)
 }
 
 fn limit_pair_priority(candidate: (&Order, &Order), current: (&Order, &Order)) -> Ordering {

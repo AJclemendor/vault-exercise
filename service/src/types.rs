@@ -49,7 +49,11 @@ pub(crate) struct BalanceView {
     pub(crate) real: U256,
     pub(crate) reserved: U256,
     pub(crate) virtual_: U256,
+    pub(crate) deficit: U256,
+    pub(crate) over_reserved: bool,
     pub(crate) vault: U256,
+    pub(crate) stale: bool,
+    pub(crate) last_refresh_age_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]

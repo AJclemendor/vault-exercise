@@ -8,6 +8,10 @@ fn wad(value: u64) -> U256 {
     U256::from(value) * U256::from(WAD)
 }
 
+fn tenth_wad(value: u64) -> U256 {
+    U256::from(value) * U256::from(WAD) / U256::from(10u8)
+}
+
 fn order(side: Side, price: u64, created_seq: u64) -> Order {
     Order {
         id: format!("ord-{created_seq}"),
@@ -23,6 +27,14 @@ fn order(side: Side, price: u64, created_seq: u64) -> Order {
         cancel_requested: false,
         matched_once: false,
     }
+}
+
+fn insert_indexed(engine: &mut Engine, order: Order) {
+    let id = order.id.clone();
+    if order.order_type == OrderType::Limit {
+        engine.index_limit_order(order.side, order.price, id.clone());
+    }
+    engine.orders.insert(id, order);
 }
 
 fn submit(
@@ -56,6 +68,9 @@ fn mark_dirty_invalidates_unreserved_cached_user() {
     engine.mark_dirty(user);
 
     assert!(engine.balance_needs_admission_refresh(user));
+    let view = engine.balance_view(user);
+    assert!(view.stale);
+    assert!(view.last_refresh_age_ms.is_some());
     assert_eq!(engine.stats.cache_dirty_events, 1);
 }
 
@@ -88,6 +103,44 @@ fn market_order_does_not_match_counterparty_created_later() {
     assert_eq!(engine.orders[&market_id].status, OrderStatus::Cancelled);
     assert_eq!(engine.orders[&sell_id].status, OrderStatus::Open);
     assert_eq!(engine.stats.fill_candidates, 0);
+    let snapshot = engine.stats_snapshot();
+    assert_eq!(snapshot.market_ioc_orders_accepted, 1);
+    assert_eq!(snapshot.currently_open_market_ioc_orders, 0);
+    assert_eq!(snapshot.market_ioc_orders_cancelled_unfilled, 1);
+}
+
+#[test]
+fn market_order_matches_older_resting_limit_from_indexed_book() {
+    let mut engine = Engine::new();
+    let buyer = address(1);
+    let seller = address(2);
+    engine.apply_balance_refresh(buyer, wad(10), U256::ZERO);
+    engine.apply_balance_refresh(seller, wad(10), U256::ZERO);
+
+    let sell_id = submit(
+        &mut engine,
+        seller,
+        Side::Sell,
+        OrderType::Limit,
+        tenth_wad(8),
+        wad(10),
+    );
+    let market_id = submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Market,
+        wad(1),
+        wad(10),
+    );
+
+    let fill = engine
+        .next_fill_candidate()
+        .expect("market buy should cross older resting ask");
+
+    assert_eq!(fill.buy_id, market_id);
+    assert_eq!(fill.sell_id, sell_id);
+    assert_eq!(fill.quote, wad(8));
 }
 
 #[test]
@@ -138,6 +191,90 @@ fn precheck_prunes_newer_reservations_before_staling_inflight_order() {
 }
 
 #[test]
+fn precheck_allows_price_improved_fill_when_actual_debit_is_affordable() {
+    let mut engine = Engine::new();
+    let buyer = address(1);
+    let seller = address(2);
+    engine.apply_balance_refresh(seller, wad(10), U256::ZERO);
+    engine.apply_balance_refresh(buyer, wad(20), U256::ZERO);
+
+    let sell_id = submit(
+        &mut engine,
+        seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+    let buy_id = submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(2),
+        wad(10),
+    );
+
+    let fill = engine
+        .next_fill_candidate()
+        .expect("newer bid should cross the resting ask");
+    assert_eq!(fill.buy_id, buy_id);
+    assert_eq!(fill.sell_id, sell_id);
+    assert_eq!(fill.quote, wad(10));
+    assert_eq!(engine.balance_view(buyer).reserved, wad(20));
+
+    engine.apply_balance_refresh(buyer, wad(10), U256::ZERO);
+    let (buyer_ok, seller_ok) = engine.prune_underfunded_fill_users(&fill);
+
+    assert!(buyer_ok);
+    assert!(seller_ok);
+    assert!(engine.fill_still_pending(&fill));
+    assert_eq!(engine.orders[&buy_id].status, OrderStatus::Open);
+    assert_eq!(engine.orders[&sell_id].status, OrderStatus::Open);
+}
+
+#[test]
+fn precheck_allows_price_improved_fill_when_actual_debit_is_funded() {
+    let mut engine = Engine::new();
+    let buyer = address(1);
+    let seller = address(2);
+    engine.apply_balance_refresh(buyer, wad(10), U256::ZERO);
+    engine.apply_balance_refresh(seller, wad(10), U256::ZERO);
+
+    let sell_id = submit(
+        &mut engine,
+        seller,
+        Side::Sell,
+        OrderType::Limit,
+        tenth_wad(8),
+        wad(10),
+    );
+    let buy_id = submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+
+    let fill = engine
+        .next_fill_candidate()
+        .expect("price-improved orders should cross");
+    assert_eq!(fill.buy_id, buy_id);
+    assert_eq!(fill.sell_id, sell_id);
+    assert_eq!(fill.quote, wad(8));
+
+    engine.apply_balance_refresh(buyer, wad(8), U256::ZERO);
+    let (buyer_ok, seller_ok) = engine.prune_underfunded_fill_users(&fill);
+
+    assert!(buyer_ok);
+    assert!(seller_ok);
+    assert!(engine.fill_still_pending(&fill));
+    assert_eq!(engine.orders[&buy_id].status, OrderStatus::Open);
+}
+
+#[test]
 fn settlement_success_uses_refreshed_chain_balances_and_counts_matched_orders_once() {
     let mut engine = Engine::new();
     let buyer = address(1);
@@ -163,7 +300,7 @@ fn settlement_success_uses_refreshed_chain_balances_and_counts_matched_orders_on
     );
     let fill = engine.next_fill_candidate().expect("orders should cross");
     assert_eq!(engine.stats.fill_candidates, 1);
-    assert_eq!(engine.stats.orders_matched, 0);
+    assert_eq!(engine.stats.unique_orders_with_successful_fill, 0);
 
     engine.apply_balance_refresh(buyer, wad(10), wad(10));
     engine.apply_balance_refresh(seller, U256::ZERO, wad(10));
@@ -177,13 +314,17 @@ fn settlement_success_uses_refreshed_chain_balances_and_counts_matched_orders_on
     assert_eq!(seller_balance.real, U256::ZERO);
     assert_eq!(seller_balance.vault, wad(10));
     assert_eq!(seller_balance.reserved, U256::ZERO);
-    assert_eq!(engine.stats.orders_matched, 2);
+    assert_eq!(engine.stats.unique_orders_with_successful_fill, 2);
     assert_eq!(engine.stats.order_sides_filled, 2);
     assert_eq!(engine.stats.successful_settlements, 1);
     let snapshot = engine.stats_snapshot();
+    assert_eq!(snapshot.orders_matched, 2);
     assert_eq!(snapshot.orders_with_successful_fill, 2);
+    assert_eq!(snapshot.unique_orders_with_successful_fill, 2);
     assert_eq!(snapshot.order_sides_filled, 2);
+    assert_eq!(snapshot.fill_sides_successfully_settled, 2);
     assert_eq!(snapshot.fills_settled, 1);
+    assert_eq!(snapshot.fills_successfully_settled, 1);
 }
 
 #[test]
@@ -227,7 +368,7 @@ fn repeated_partial_fills_do_not_double_count_the_same_matched_order() {
     assert_eq!(first_fill.buy_id, buyer_id);
     assert_eq!(first_fill.sell_id, seller_one_id);
     engine.apply_settlement_success(&first_fill);
-    assert_eq!(engine.stats.orders_matched, 2);
+    assert_eq!(engine.stats.unique_orders_with_successful_fill, 2);
     assert_eq!(engine.stats.successful_settlements, 1);
 
     let second_fill = engine
@@ -237,12 +378,17 @@ fn repeated_partial_fills_do_not_double_count_the_same_matched_order() {
     assert_eq!(second_fill.sell_id, seller_two_id);
     engine.apply_settlement_success(&second_fill);
 
-    assert_eq!(engine.stats.orders_matched, 3);
+    assert_eq!(engine.stats.unique_orders_with_successful_fill, 3);
     assert_eq!(engine.stats.order_sides_filled, 4);
     assert_eq!(engine.stats.successful_settlements, 2);
     let snapshot = engine.stats_snapshot();
+    assert_eq!(snapshot.orders_matched, 4);
     assert_eq!(snapshot.orders_with_successful_fill, 3);
+    assert_eq!(snapshot.unique_orders_with_successful_fill, 3);
+    assert_eq!(snapshot.order_sides_filled, 4);
+    assert_eq!(snapshot.fill_sides_successfully_settled, 4);
     assert_eq!(snapshot.fills_settled, 2);
+    assert_eq!(snapshot.fills_successfully_settled, 2);
 }
 
 #[test]
@@ -287,6 +433,59 @@ fn rejection_stats_are_split_by_reason() {
     assert_eq!(snapshot.orders_rejected_insufficient_balance, 1);
     assert_eq!(snapshot.orders_rejected_stale_balance_cache, 1);
     assert_eq!(snapshot.orders_failed_balance_refresh, 1);
+    assert_eq!(snapshot.orders_admission_failures, 4);
+    assert_eq!(snapshot.orders_admission_failures_pct, 100.0);
+}
+
+#[test]
+fn balance_view_exposes_over_reserved_deficit() {
+    let mut engine = Engine::new();
+    let seller = address(1);
+    engine.apply_balance_refresh(seller, wad(20), U256::ZERO);
+
+    submit(
+        &mut engine,
+        seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+    engine.apply_balance_refresh(seller, wad(5), U256::ZERO);
+
+    let balance = engine.balance_view(seller);
+    assert_eq!(balance.real, wad(5));
+    assert_eq!(balance.reserved, wad(10));
+    assert_eq!(balance.virtual_, U256::ZERO);
+    assert_eq!(balance.deficit, wad(5));
+    assert!(balance.over_reserved);
+}
+
+#[test]
+fn open_orders_are_returned_in_created_sequence_order() {
+    let mut engine = Engine::new();
+    let seller = address(1);
+    engine.apply_balance_refresh(seller, wad(20), U256::ZERO);
+
+    for _ in 0..12 {
+        submit(
+            &mut engine,
+            seller,
+            Side::Sell,
+            OrderType::Limit,
+            wad(1),
+            wad(1),
+        );
+    }
+
+    let ids: Vec<_> = engine
+        .open_orders(Some(seller))
+        .into_iter()
+        .map(|order| order.id)
+        .collect();
+    assert_eq!(ids[1], "ord-2");
+    assert_eq!(ids[9], "ord-10");
+    assert_eq!(ids[11], "ord-12");
 }
 
 #[test]
@@ -298,14 +497,64 @@ fn settlement_failure_stats_are_split_by_failure_class() {
     engine.record_settlement_receipt_failed();
     engine.record_settlement_tx_attempt();
     engine.record_settlement_reverted();
+    engine.record_settlement_unknown_outcome();
 
     let snapshot = engine.stats_snapshot();
     assert_eq!(snapshot.settlement_tx_attempts, 3);
+    assert_eq!(snapshot.settlement_precheck_attempts, 0);
     assert_eq!(snapshot.settlement_send_failures, 1);
     assert_eq!(snapshot.settlement_receipt_failures, 1);
     assert_eq!(snapshot.settlements_reverted, 1);
-    assert_eq!(snapshot.settlement_receipt_reverts, 1);
+    assert_eq!(snapshot.settlement_reverts, 1);
+    assert_eq!(snapshot.settlement_receipt_status_reverted, 1);
+    assert_eq!(snapshot.settlement_tx_reverts, 1);
     assert_eq!(snapshot.settlements_reverted_pct, 100.0 / 3.0);
+    assert_eq!(snapshot.settlement_tx_failures, 3);
+    assert_eq!(snapshot.settlement_tx_failures_pct, 100.0);
+    assert_eq!(snapshot.settlement_failures, 3);
+    assert_eq!(snapshot.settlement_unknown_outcomes, 1);
+}
+
+#[test]
+fn crossing_limit_search_skips_self_match_price_levels() {
+    let mut engine = Engine::new();
+    let shared_user = address(1);
+    let other_seller = address(2);
+    engine.apply_balance_refresh(shared_user, wad(100), U256::ZERO);
+    engine.apply_balance_refresh(other_seller, wad(10), U256::ZERO);
+
+    let buy_id = submit(
+        &mut engine,
+        shared_user,
+        Side::Buy,
+        OrderType::Limit,
+        wad(10),
+        wad(1),
+    );
+    let self_sell_id = submit(
+        &mut engine,
+        shared_user,
+        Side::Sell,
+        OrderType::Limit,
+        wad(5),
+        wad(1),
+    );
+    let other_sell_id = submit(
+        &mut engine,
+        other_seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(6),
+        wad(1),
+    );
+
+    let fill = engine
+        .next_fill_candidate()
+        .expect("compatible later ask level should be selected");
+
+    assert_eq!(fill.buy_id, buy_id);
+    assert_eq!(fill.sell_id, other_sell_id);
+    assert_eq!(engine.orders[&self_sell_id].status, OrderStatus::Open);
 }
 
 #[test]
@@ -446,6 +695,34 @@ fn limit_pair_priority_is_fifo_within_price_levels() {
         limit_pair_priority((&same_buy, &older_sell), (&same_buy, &newer_sell)),
         Ordering::Less
     );
+}
+
+#[test]
+fn best_crossing_limits_preserves_price_priority_before_fifo_when_skipping_self_trade() {
+    let mut engine = Engine::new();
+    let user_a = address(1);
+    let user_b = address(2);
+
+    let mut older_buy = order(Side::Buy, 10, 1);
+    older_buy.user = user_a;
+    let mut better_sell_same_user = order(Side::Sell, 8, 2);
+    better_sell_same_user.user = user_a;
+    let mut worse_sell_other_user = order(Side::Sell, 9, 3);
+    worse_sell_other_user.user = user_b;
+    let mut newer_buy_other_user = order(Side::Buy, 10, 4);
+    newer_buy_other_user.user = user_b;
+
+    insert_indexed(&mut engine, older_buy);
+    insert_indexed(&mut engine, better_sell_same_user);
+    insert_indexed(&mut engine, worse_sell_other_user);
+    insert_indexed(&mut engine, newer_buy_other_user);
+
+    let (buy_id, sell_id) = engine
+        .best_crossing_limits()
+        .expect("there should be a non-self crossing pair");
+
+    assert_eq!(buy_id, "ord-4");
+    assert_eq!(sell_id, "ord-2");
 }
 
 #[test]

@@ -1,5 +1,5 @@
 use alloy::network::Ethereum;
-use alloy::primitives::{Address, U256, keccak256};
+use alloy::primitives::{Address, TxHash, U256, keccak256};
 use alloy::providers::{PendingTransactionBuilder, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
@@ -11,6 +11,9 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::time::Duration;
 use thiserror::Error;
+
+const RECEIPT_CONFIRM_RETRIES: usize = 3;
+const RECEIPT_CONFIRM_RETRY_SLEEP: Duration = Duration::from_millis(250);
 
 sol! {
     #[sol(rpc)]
@@ -136,13 +139,58 @@ impl ChainClient {
         &self,
         pending: PendingTransactionBuilder<Ethereum>,
     ) -> std::result::Result<(), SettlementConfirmationError> {
-        let receipt = pending.get_receipt().await.map_err(|err| {
-            SettlementConfirmationError::Receipt(anyhow!(err).context("matchOrders receipt failed"))
-        })?;
-        if !receipt.status() {
-            return Err(SettlementConfirmationError::Reverted);
+        let tx_hash = *pending.tx_hash();
+        let (provider, config) = pending.split();
+        let mut last_error = None;
+
+        for attempt in 1..=RECEIPT_CONFIRM_RETRIES {
+            let pending = PendingTransactionBuilder::from_config(provider.clone(), config.clone());
+            match pending.get_receipt().await {
+                Ok(receipt) => {
+                    if !receipt.status() {
+                        return Err(SettlementConfirmationError::Reverted);
+                    }
+                    return Ok(());
+                }
+                Err(err) => {
+                    last_error = Some(anyhow!(err).context(format!(
+                        "matchOrders receipt failed for tx {tx_hash} attempt {attempt}/{RECEIPT_CONFIRM_RETRIES}"
+                    )));
+                    if attempt < RECEIPT_CONFIRM_RETRIES {
+                        tokio::time::sleep(RECEIPT_CONFIRM_RETRY_SLEEP).await;
+                    }
+                }
+            }
         }
-        Ok(())
+
+        Err(SettlementConfirmationError::Receipt(
+            last_error.expect("receipt retry loop should record an error"),
+        ))
+    }
+
+    pub(crate) async fn settlement_receipt_status(
+        &self,
+        tx_hash: TxHash,
+    ) -> Result<Option<SettlementReceiptStatus>> {
+        let receipt = self
+            .rpc(
+                "eth_getTransactionReceipt",
+                json!([format!("{tx_hash:#x}")]),
+            )
+            .await?;
+        if receipt.is_null() {
+            return Ok(None);
+        }
+
+        let status = receipt
+            .get("status")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("transaction receipt did not include status"))?;
+        match parse_hex_u64(status)? {
+            0 => Ok(Some(SettlementReceiptStatus::Reverted)),
+            1 => Ok(Some(SettlementReceiptStatus::Succeeded)),
+            value => Err(anyhow!("unexpected transaction receipt status {value}")),
+        }
     }
 
     pub(crate) async fn block_number(&self) -> Result<u64> {
@@ -266,6 +314,18 @@ pub(crate) enum SettlementConfirmationError {
     Receipt(#[source] anyhow::Error),
     #[error("matchOrders transaction reverted")]
     Reverted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettlementReceiptStatus {
+    Succeeded,
+    Reverted,
+}
+
+impl SettlementConfirmationError {
+    pub(crate) fn outcome_is_uncertain(&self) -> bool {
+        matches!(self, Self::Receipt(_))
+    }
 }
 
 #[derive(Serialize)]
