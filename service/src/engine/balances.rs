@@ -2,10 +2,11 @@ use alloy::primitives::{Address, U256};
 use std::cmp::Ordering;
 use std::time::{Duration, Instant};
 
+use crate::runtime::balance_tuning;
 use crate::types::BalanceView;
 
+use super::Engine;
 use super::math::sub_or_zero;
-use super::{ACTIVE_CACHE_MAX_AGE, ADMISSION_CACHE_MAX_AGE, Engine};
 
 impl Engine {
     pub(crate) fn balance_needs_admission_refresh(&self, user: Address) -> bool {
@@ -15,18 +16,45 @@ impl Engine {
         if balance.dirty {
             return true;
         }
+        let tuning = balance_tuning();
         match balance.last_refresh {
-            Some(last) => last.elapsed() > ADMISSION_CACHE_MAX_AGE,
+            Some(last) => last.elapsed() > tuning.admission_cache_max_age,
             None => true,
         }
     }
 
     pub(crate) fn apply_balance_refresh(&mut self, user: Address, real: U256, vault: U256) {
+        self.apply_balance_refresh_at_block(user, real, vault, u64::MAX);
+    }
+
+    pub(crate) fn apply_balance_refresh_at_block(
+        &mut self,
+        user: Address,
+        real: U256,
+        vault: U256,
+        block: u64,
+    ) {
         let balance = self.balances.entry(user).or_default();
+        if balance
+            .last_refresh_block
+            .map(|last_block| block < last_block)
+            .unwrap_or(false)
+        {
+            return;
+        }
+
         balance.real = real;
         balance.vault = vault;
-        balance.dirty = false;
+        if balance
+            .dirty_after_block
+            .map(|dirty_block| block >= dirty_block)
+            .unwrap_or(true)
+        {
+            balance.dirty = false;
+            balance.dirty_after_block = None;
+        }
         balance.last_refresh = Some(Instant::now());
+        balance.last_refresh_block = Some(block);
     }
 
     pub(crate) fn balance_view(&self, user: Address) -> BalanceView {
@@ -58,17 +86,59 @@ impl Engine {
         }
     }
 
+    pub(crate) fn balance_view_with_chain_values(
+        &self,
+        user: Address,
+        real: U256,
+        vault: U256,
+    ) -> BalanceView {
+        let reserved = self
+            .balances
+            .get(&user)
+            .map(|balance| balance.reserved)
+            .unwrap_or(U256::ZERO);
+        let deficit = sub_or_zero(reserved, real);
+        BalanceView {
+            real,
+            reserved,
+            virtual_: sub_or_zero(real, reserved),
+            deficit,
+            over_reserved: deficit > U256::ZERO,
+            vault,
+            stale: false,
+            last_refresh_age_ms: None,
+        }
+    }
+
     pub(crate) fn mark_dirty(&mut self, user: Address) {
         if let Some(balance) = self.balances.get_mut(&user)
             && !balance.dirty
         {
             balance.dirty = true;
+            balance.dirty_after_block = None;
             self.stats.cache_dirty_events += 1;
         }
     }
 
+    pub(crate) fn mark_dirty_at_block(&mut self, user: Address, block: u64) {
+        let Some(balance) = self.balances.get_mut(&user) else {
+            return;
+        };
+        if !balance.dirty {
+            balance.dirty = true;
+            self.stats.cache_dirty_events += 1;
+        }
+        balance.dirty_after_block = Some(
+            balance
+                .dirty_after_block
+                .map(|current| current.max(block))
+                .unwrap_or(block),
+        );
+    }
+
     pub(crate) fn refresh_candidates(&self, limit: usize) -> Vec<Address> {
         let now = Instant::now();
+        let tuning = balance_tuning();
         let mut candidates: Vec<_> = self
             .balances
             .iter()
@@ -77,7 +147,7 @@ impl Engine {
                 balance.dirty
                     || balance
                         .last_refresh
-                        .map(|last| now.duration_since(last) > ACTIVE_CACHE_MAX_AGE)
+                        .map(|last| now.duration_since(last) > tuning.active_cache_max_age)
                         .unwrap_or(true)
             })
             .map(|(user, balance)| {
@@ -102,6 +172,6 @@ impl Engine {
     }
 
     pub(crate) fn prune_user_to_balance(&mut self, user: Address, exact_order: Option<String>) {
-        self.stale_unsafe_live_orders_for_user(user, exact_order.as_deref());
+        self.stale_over_reserved_orders_for_user(user, exact_order.as_deref());
     }
 }

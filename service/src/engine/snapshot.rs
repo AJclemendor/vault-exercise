@@ -73,7 +73,10 @@ impl Engine {
         let settlement_tx_failures = self.stats.settlement_send_failures
             + self.stats.settlement_receipt_failures
             + self.stats.settlements_reverted;
-        let settlement_failures = self.stats.settlements_precheck_failed + settlement_tx_failures;
+        let settlement_failures = self.stats.settlements_precheck_failed
+            + self.stats.settlement_send_failures
+            + self.stats.settlements_reverted
+            + self.stats.settlement_unknown_outcomes;
         let fill_candidates = self.stats.fill_candidates;
         let settlement_attempts = self.stats.settlements_attempted;
         let settlement_precheck_attempts = settlement_attempts;
@@ -89,7 +92,7 @@ impl Engine {
         let settlement_pending_outcomes = self
             .stats
             .fill_candidates
-            .saturating_sub(settlement_terminal_outcomes + self.stats.settlement_unknown_outcomes);
+            .saturating_sub(settlement_terminal_outcomes);
 
         StatsSnapshot {
             orders_received: self.stats.orders_received,

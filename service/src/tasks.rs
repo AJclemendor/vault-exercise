@@ -1,14 +1,10 @@
 mod settlement;
 
 use crate::AppState;
-use std::time::Duration;
+use crate::runtime::task_tuning;
 
 pub(crate) use settlement::settlement_loop;
 
-const ACTIVE_REFRESH_INTERVAL: Duration = Duration::from_millis(300);
-const LOG_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const STATS_LOG_INTERVAL: Duration = Duration::from_secs(5);
-const ACTIVE_REFRESH_BUDGET: usize = 40;
 const BAR_WIDTH: usize = 24;
 const ANSI_RESET: &str = "\x1b[0m";
 const ANSI_DIM: &str = "\x1b[2m";
@@ -18,18 +14,24 @@ const ANSI_YELLOW: &str = "\x1b[33m";
 const ANSI_CYAN: &str = "\x1b[36m";
 
 pub(crate) async fn active_refresh_loop(state: AppState) {
+    let tuning = task_tuning();
     loop {
-        tokio::time::sleep(ACTIVE_REFRESH_INTERVAL).await;
+        tokio::time::sleep(tuning.active_refresh_interval).await;
         let candidates = {
             let engine = state.engine.lock().await;
-            engine.refresh_candidates(ACTIVE_REFRESH_BUDGET)
+            engine.refresh_candidates(tuning.active_refresh_budget)
         };
 
         for user in candidates {
             match state.chain.read_user_balances(user).await {
-                Ok((real, vault)) => {
+                Ok(balance) => {
                     let mut engine = state.engine.lock().await;
-                    engine.apply_balance_refresh(user, real, vault);
+                    engine.apply_balance_refresh_at_block(
+                        user,
+                        balance.real,
+                        balance.vault,
+                        balance.block,
+                    );
                     engine.prune_user_to_balance(user, None);
                     engine.record_background_balance_refresh();
                 }
@@ -44,6 +46,7 @@ pub(crate) async fn active_refresh_loop(state: AppState) {
 }
 
 pub(crate) async fn log_poll_loop(state: AppState) {
+    let tuning = task_tuning();
     let mut last_seen = match state.chain.block_number().await {
         Ok(block) => block,
         Err(err) => {
@@ -53,7 +56,7 @@ pub(crate) async fn log_poll_loop(state: AppState) {
     };
 
     loop {
-        tokio::time::sleep(LOG_POLL_INTERVAL).await;
+        tokio::time::sleep(tuning.log_poll_interval).await;
         let latest = match state.chain.block_number().await {
             Ok(block) => block,
             Err(err) => {
@@ -69,11 +72,11 @@ pub(crate) async fn log_poll_loop(state: AppState) {
         let from = last_seen + 1;
         let to = latest;
         match state.chain.dirty_users_from_logs(from, to).await {
-            Ok(users) => {
-                if !users.is_empty() {
+            Ok(events) => {
+                if !events.is_empty() {
                     let mut engine = state.engine.lock().await;
-                    for user in users {
-                        engine.mark_dirty(user);
+                    for event in events {
+                        engine.mark_dirty_at_block(event.user, event.block);
                     }
                 }
                 last_seen = to;
@@ -86,8 +89,9 @@ pub(crate) async fn log_poll_loop(state: AppState) {
 }
 
 pub(crate) async fn stats_log_loop(state: AppState) {
+    let tuning = task_tuning();
     loop {
-        tokio::time::sleep(STATS_LOG_INTERVAL).await;
+        tokio::time::sleep(tuning.stats_log_interval).await;
         let snapshot = {
             let engine = state.engine.lock().await;
             engine.stats_snapshot()

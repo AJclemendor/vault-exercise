@@ -25,9 +25,14 @@ pub(crate) async fn submit_order(
     };
     if needs_refresh {
         match state.chain.read_user_balances(user).await {
-            Ok((real, vault)) => {
+            Ok(balance) => {
                 let mut engine = state.engine.lock().await;
-                engine.apply_balance_refresh(user, real, vault);
+                engine.apply_balance_refresh_at_block(
+                    user,
+                    balance.real,
+                    balance.vault,
+                    balance.block,
+                );
                 engine.record_admission_refresh_succeeded();
             }
             Err(err) => {
@@ -67,23 +72,17 @@ pub(crate) async fn get_balance(
 ) -> std::result::Result<Json<BalanceView>, ApiError> {
     let user = Address::from_str(&address)
         .map_err(|_| ApiError::BadRequest(format!("invalid address {address}")))?;
-    let needs_refresh = {
-        let engine = state.engine.lock().await;
-        engine.balance_needs_admission_refresh(user)
-    };
-
-    if needs_refresh {
-        let (real, vault) =
-            state.chain.read_user_balances(user).await.map_err(|err| {
-                ApiError::Chain(format!("failed to refresh balance view: {err:#}"))
-            })?;
-        let mut engine = state.engine.lock().await;
-        engine.apply_balance_refresh(user, real, vault);
-        engine.prune_user_to_balance(user, None);
-    }
-
+    let balance = state
+        .chain
+        .read_user_balances(user)
+        .await
+        .map_err(|err| ApiError::Chain(format!("failed to read balance view: {err:#}")))?;
     let engine = state.engine.lock().await;
-    Ok(Json(engine.balance_view(user)))
+    Ok(Json(engine.balance_view_with_chain_values(
+        user,
+        balance.real,
+        balance.vault,
+    )))
 }
 
 pub(crate) async fn list_orders(

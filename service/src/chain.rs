@@ -7,13 +7,11 @@ use alloy::transports::http::reqwest::Url as AlloyUrl;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::str::FromStr;
-use std::time::Duration;
 use thiserror::Error;
 
-const RECEIPT_CONFIRM_RETRIES: usize = 3;
-const RECEIPT_CONFIRM_RETRY_SLEEP: Duration = Duration::from_millis(250);
+use crate::runtime::chain_tuning;
 
 sol! {
     #[sol(rpc)]
@@ -55,8 +53,9 @@ impl ChainClient {
         let operator = operator_key
             .parse::<PrivateKeySigner>()
             .context("invalid operator private key")?;
+        let tuning = chain_tuning();
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
+            .timeout(tuning.rpc_http_timeout)
             .build()
             .context("failed to build rpc http client")?;
 
@@ -72,7 +71,9 @@ impl ChainClient {
         })
     }
 
-    pub(crate) async fn read_user_balances(&self, user: Address) -> Result<(U256, U256)> {
+    pub(crate) async fn read_user_balances(&self, user: Address) -> Result<BalanceRead> {
+        let block = self.block_number().await?;
+        let block_tag = hex_block(block);
         let data = balance_of_call_data(user);
         let responses = self
             .rpc_batch(&[
@@ -85,7 +86,7 @@ impl ChainClient {
                             "to": format!("{:#x}", self.token_address),
                             "data": data
                         },
-                        "latest"
+                        block_tag.clone()
                     ]),
                 },
                 JsonRpcRequest {
@@ -97,7 +98,7 @@ impl ChainClient {
                             "to": format!("{:#x}", self.vault_address),
                             "data": data
                         },
-                        "latest"
+                        block_tag.clone()
                     ]),
                 },
             ])
@@ -114,7 +115,11 @@ impl ChainClient {
             .ok_or_else(|| anyhow!("vault balanceOf response was not a hex string"))
             .and_then(parse_hex_u256)
             .context("vault balanceOf failed")?;
-        Ok((real, vault_balance))
+        Ok(BalanceRead {
+            real,
+            vault: vault_balance,
+            block,
+        })
     }
 
     pub(crate) async fn submit_settlement(
@@ -142,8 +147,9 @@ impl ChainClient {
         let tx_hash = *pending.tx_hash();
         let (provider, config) = pending.split();
         let mut last_error = None;
+        let tuning = chain_tuning();
 
-        for attempt in 1..=RECEIPT_CONFIRM_RETRIES {
+        for attempt in 1..=tuning.receipt_confirm_retries {
             let pending = PendingTransactionBuilder::from_config(provider.clone(), config.clone());
             match pending.get_receipt().await {
                 Ok(receipt) => {
@@ -154,10 +160,11 @@ impl ChainClient {
                 }
                 Err(err) => {
                     last_error = Some(anyhow!(err).context(format!(
-                        "matchOrders receipt failed for tx {tx_hash} attempt {attempt}/{RECEIPT_CONFIRM_RETRIES}"
+                        "matchOrders receipt failed for tx {tx_hash} attempt {attempt}/{}",
+                        tuning.receipt_confirm_retries
                     )));
-                    if attempt < RECEIPT_CONFIRM_RETRIES {
-                        tokio::time::sleep(RECEIPT_CONFIRM_RETRY_SLEEP).await;
+                    if attempt < tuning.receipt_confirm_retries {
+                        tokio::time::sleep(tuning.receipt_confirm_retry_sleep).await;
                     }
                 }
             }
@@ -206,7 +213,7 @@ impl ChainClient {
         &self,
         from_block: u64,
         to_block: u64,
-    ) -> Result<Vec<Address>> {
+    ) -> Result<Vec<DirtyUserEvent>> {
         if from_block > to_block {
             return Ok(Vec::new());
         }
@@ -228,7 +235,7 @@ impl ChainClient {
         let value = self.rpc("eth_getLogs", filter).await?;
         let logs: Vec<RpcLog> =
             serde_json::from_value(value).context("invalid eth_getLogs response")?;
-        let mut users = HashSet::new();
+        let mut users = HashMap::<Address, u64>::new();
         let transfer_topic = self.transfer_topic.to_ascii_lowercase();
         let match_topic = self.match_topic.to_ascii_lowercase();
         let withdraw_topic = self.withdraw_topic.to_ascii_lowercase();
@@ -238,15 +245,24 @@ impl ChainClient {
                 continue;
             };
 
+            let block = log
+                .block_number
+                .as_deref()
+                .and_then(|block| parse_hex_u64(block).ok())
+                .unwrap_or(to_block);
+
             if topic0 == transfer_topic || topic0 == match_topic {
-                collect_indexed_address(&log, 1, &mut users);
-                collect_indexed_address(&log, 2, &mut users);
+                collect_indexed_address_at_block(&log, 1, block, &mut users);
+                collect_indexed_address_at_block(&log, 2, block, &mut users);
             } else if topic0 == withdraw_topic {
-                collect_indexed_address(&log, 1, &mut users);
+                collect_indexed_address_at_block(&log, 1, block, &mut users);
             }
         }
 
-        Ok(users.into_iter().collect())
+        Ok(users
+            .into_iter()
+            .map(|(user, block)| DirtyUserEvent { user, block })
+            .collect())
     }
 
     async fn rpc(&self, method: &str, params: Value) -> Result<Value> {
@@ -308,6 +324,19 @@ impl ChainClient {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BalanceRead {
+    pub(crate) real: U256,
+    pub(crate) vault: U256,
+    pub(crate) block: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DirtyUserEvent {
+    pub(crate) user: Address,
+    pub(crate) block: u64,
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum SettlementConfirmationError {
     #[error("matchOrders receipt failed: {0:#}")]
@@ -346,6 +375,8 @@ struct JsonRpcResponse {
 #[derive(Deserialize)]
 struct RpcLog {
     topics: Vec<String>,
+    #[serde(rename = "blockNumber")]
+    block_number: Option<String>,
 }
 
 fn event_topic(signature: &str) -> String {
@@ -375,11 +406,19 @@ fn balance_of_call_data(user: Address) -> String {
     format!("0x70a08231{user:0>64}")
 }
 
-fn collect_indexed_address(log: &RpcLog, topic_index: usize, users: &mut HashSet<Address>) {
+fn collect_indexed_address_at_block(
+    log: &RpcLog,
+    topic_index: usize,
+    block: u64,
+    users: &mut HashMap<Address, u64>,
+) {
     if let Some(topic) = log.topics.get(topic_index)
         && let Some(user) = address_from_topic(topic)
     {
-        users.insert(user);
+        users
+            .entry(user)
+            .and_modify(|current| *current = (*current).max(block))
+            .or_insert(block);
     }
 }
 

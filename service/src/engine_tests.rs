@@ -75,6 +75,42 @@ fn mark_dirty_invalidates_unreserved_cached_user() {
 }
 
 #[test]
+fn older_refresh_does_not_clear_dirty_from_later_log_block() {
+    let mut engine = Engine::new();
+    let user = address(1);
+
+    engine.apply_balance_refresh_at_block(user, wad(100), U256::ZERO, 10);
+    engine.mark_dirty_at_block(user, 12);
+    engine.apply_balance_refresh_at_block(user, wad(90), U256::ZERO, 11);
+
+    assert!(engine.balance_view(user).stale);
+
+    engine.apply_balance_refresh_at_block(user, wad(80), U256::ZERO, 12);
+
+    let view = engine.balance_view(user);
+    assert!(!view.stale);
+    assert_eq!(view.real, wad(80));
+}
+
+#[test]
+fn direct_balance_view_does_not_mutate_cached_balance_state() {
+    let mut engine = Engine::new();
+    let user = address(1);
+
+    engine.apply_balance_refresh_at_block(user, wad(100), U256::ZERO, 10);
+    engine.mark_dirty_at_block(user, 11);
+
+    let direct_view = engine.balance_view_with_chain_values(user, wad(75), wad(25));
+    assert_eq!(direct_view.real, wad(75));
+    assert_eq!(direct_view.vault, wad(25));
+    assert!(!direct_view.stale);
+
+    let cached_view = engine.balance_view(user);
+    assert_eq!(cached_view.real, wad(100));
+    assert!(cached_view.stale);
+}
+
+#[test]
 fn market_order_does_not_match_counterparty_created_later() {
     let mut engine = Engine::new();
     let buyer = address(1);
@@ -556,7 +592,7 @@ fn settlement_success_uses_refreshed_chain_balances_and_counts_matched_orders_on
 }
 
 #[test]
-fn settlement_success_preserves_funded_sibling_orders_and_stales_only_unsafe_orders() {
+fn settlement_success_stales_all_resting_siblings_when_user_is_over_reserved() {
     let mut engine = Engine::new();
     let buyer = address(1);
     let seller = address(2);
@@ -605,10 +641,10 @@ fn settlement_success_preserves_funded_sibling_orders_and_stales_only_unsafe_ord
     engine.apply_settlement_success(&fill);
 
     assert_eq!(engine.orders[&filled_buy_id].status, OrderStatus::Filled);
-    assert_eq!(engine.orders[&funded_sibling_id].status, OrderStatus::Open);
+    assert_eq!(engine.orders[&funded_sibling_id].status, OrderStatus::Stale);
     assert_eq!(engine.orders[&unsafe_sibling_id].status, OrderStatus::Stale);
-    assert_eq!(engine.balance_view(buyer).reserved, wad(5));
-    assert_eq!(engine.stats.orders_marked_stale, 1);
+    assert_eq!(engine.balance_view(buyer).reserved, U256::ZERO);
+    assert_eq!(engine.stats.orders_marked_stale, 2);
 }
 
 #[test]

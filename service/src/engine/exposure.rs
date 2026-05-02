@@ -1,5 +1,4 @@
 use alloy::primitives::{Address, U256};
-use std::cmp::Reverse;
 
 use crate::types::{OrderStatus, OrderType};
 
@@ -31,12 +30,19 @@ impl Engine {
         })
     }
 
-    pub(crate) fn stale_unsafe_live_orders_for_user(
+    pub(crate) fn stale_over_reserved_orders_for_user(
         &mut self,
         user: Address,
         exclude_order_id: Option<&str>,
     ) {
-        let mut candidates: Vec<_> = self
+        let Some(balance) = self.balances.get(&user) else {
+            return;
+        };
+        if balance.reserved <= balance.real {
+            return;
+        }
+
+        let candidates: Vec<_> = self
             .orders
             .values()
             .filter(|order| {
@@ -47,24 +53,20 @@ impl Engine {
                         .map(|excluded| order.id != excluded)
                         .unwrap_or(true)
             })
-            .map(|order| (Reverse(order.created_seq), order.id.clone()))
+            .map(|order| order.id.clone())
             .collect();
-        candidates.sort_by_key(|candidate| candidate.0);
 
-        for (_, order_id) in candidates {
-            let Some(order) = self.orders.get(&order_id) else {
-                continue;
-            };
-            if !order.is_live() || order.in_flight_size > U256::ZERO {
-                continue;
-            }
-
-            let required = gross_required_for_order(order);
-            let available = self.hard_available_for_user_excluding_order(user, &order_id);
-            if required > available {
-                self.terminal_order(&order_id, OrderStatus::Stale);
-            }
+        for order_id in candidates {
+            self.terminal_order(&order_id, OrderStatus::Stale);
         }
+    }
+
+    pub(crate) fn stale_unsafe_live_orders_for_user(
+        &mut self,
+        user: Address,
+        exclude_order_id: Option<&str>,
+    ) {
+        self.stale_over_reserved_orders_for_user(user, exclude_order_id);
     }
 
     pub(super) fn required_balance_after_fill_for_order(
@@ -95,18 +97,6 @@ impl Engine {
             .fold(U256::ZERO, |total, order| {
                 total + hard_locked_for_order(order)
             })
-    }
-
-    fn hard_available_for_user_excluding_order(&self, user: Address, order_id: &str) -> U256 {
-        let real = self
-            .balances
-            .get(&user)
-            .map(|balance| balance.real)
-            .unwrap_or(U256::ZERO);
-        sub_or_zero(
-            real,
-            self.hard_locked_for_user_excluding_order(user, order_id),
-        )
     }
 }
 

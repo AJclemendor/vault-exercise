@@ -107,8 +107,8 @@ fn unresolved_receipt_keeps_fill_pending_and_reservations_locked() {
     assert_eq!(engine.open_orders(Some(buyer))[0].status, OrderStatus::Open);
     assert!(engine.next_fill_candidate().is_none());
     let snapshot = engine.stats_snapshot();
-    assert_eq!(snapshot.settlement_receipt_failures, 1);
-    assert_eq!(snapshot.settlement_unknown_outcomes, 1);
+    assert_eq!(snapshot.settlement_receipt_failures, 0);
+    assert_eq!(snapshot.settlement_unknown_outcomes, 0);
     assert_eq!(snapshot.orders_marked_stale, 0);
 }
 

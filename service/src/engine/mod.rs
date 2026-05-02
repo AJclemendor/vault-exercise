@@ -12,7 +12,7 @@ use crate::types::{ApiError, SubmitOrderRequest};
 use crate::types::{OrderResponse, OrderStatus, OrderType, OrderView, Side};
 use alloy::primitives::{Address, U256};
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[cfg(test)]
 use matching::limit_pair_priority;
@@ -20,8 +20,6 @@ use matching::limit_pair_priority;
 use std::cmp::Ordering;
 
 const WAD: u128 = 1_000_000_000_000_000_000;
-const ADMISSION_CACHE_MAX_AGE: Duration = Duration::from_secs(3);
-const ACTIVE_CACHE_MAX_AGE: Duration = Duration::from_millis(900);
 
 #[derive(Debug, Clone)]
 struct BalanceState {
@@ -29,7 +27,9 @@ struct BalanceState {
     reserved: U256,
     vault: U256,
     dirty: bool,
+    dirty_after_block: Option<u64>,
     last_refresh: Option<Instant>,
+    last_refresh_block: Option<u64>,
 }
 
 impl Default for BalanceState {
@@ -39,7 +39,9 @@ impl Default for BalanceState {
             reserved: U256::ZERO,
             vault: U256::ZERO,
             dirty: true,
+            dirty_after_block: None,
             last_refresh: None,
+            last_refresh_block: None,
         }
     }
 }

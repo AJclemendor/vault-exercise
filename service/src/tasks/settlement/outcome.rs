@@ -2,17 +2,12 @@ use super::{PendingSettlement, PostSubmitFailurePolicy, PreSubmitDecision, Submi
 use crate::AppState;
 use crate::chain::{SettlementConfirmationError, SettlementReceiptStatus};
 use crate::engine::{Engine, FillCandidate};
+use crate::runtime::receipt_tuning;
 use crate::sequencing::OrderedGate;
 use alloy::primitives::TxHash;
 use anyhow::Result;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::OwnedSemaphorePermit;
-
-const UNCERTAIN_RECEIPT_RECHECKS: usize = 20;
-const UNCERTAIN_RECEIPT_RECHECK_INTERVAL: Duration = Duration::from_millis(250);
-const DEFERRED_RECEIPT_RECHECKS: usize = 30;
-const DEFERRED_RECEIPT_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 pub(super) async fn process_fill(state: &AppState, fill: &FillCandidate) {
     if prepare_fill_for_submit(state, fill).await == PreSubmitDecision::Abort {
@@ -95,7 +90,7 @@ pub(super) async fn submit_settlement_once(
                 engine.record_settlement_send_failed();
                 engine.mark_dirty(fill.buyer);
                 engine.mark_dirty(fill.seller);
-                engine.abort_fill(fill, false, false);
+                engine.abort_fill(fill, true, true);
                 SubmitOutcome::SendFailed
             }
             SettlementFailureAction::HoldUncertainOutcome => {
@@ -230,21 +225,22 @@ async fn resolve_uncertain_settlement(
     tx_hash: TxHash,
 ) -> UncertainSettlementResolution {
     let mut last_error = None;
+    let tuning = receipt_tuning();
 
-    for attempt in 1..=UNCERTAIN_RECEIPT_RECHECKS {
-        tokio::time::sleep(UNCERTAIN_RECEIPT_RECHECK_INTERVAL).await;
+    for attempt in 1..=tuning.uncertain_rechecks {
+        tokio::time::sleep(tuning.uncertain_recheck_interval).await;
         match state.chain.settlement_receipt_status(tx_hash).await {
             Ok(Some(SettlementReceiptStatus::Succeeded)) => {
                 eprintln!(
                     "[settlement] matchOrders receipt resolved success seq={} tx={} attempt={}/{}",
-                    fill.seq, tx_hash, attempt, UNCERTAIN_RECEIPT_RECHECKS
+                    fill.seq, tx_hash, attempt, tuning.uncertain_rechecks
                 );
                 return UncertainSettlementResolution::Succeeded;
             }
             Ok(Some(SettlementReceiptStatus::Reverted)) => {
                 eprintln!(
                     "[settlement] matchOrders receipt resolved revert seq={} tx={} attempt={}/{}",
-                    fill.seq, tx_hash, attempt, UNCERTAIN_RECEIPT_RECHECKS
+                    fill.seq, tx_hash, attempt, tuning.uncertain_rechecks
                 );
                 return UncertainSettlementResolution::Reverted;
             }
@@ -257,7 +253,7 @@ async fn resolve_uncertain_settlement(
 
     eprintln!(
         "[settlement] matchOrders receipt unresolved after {} checks seq={} tx={} last_error={}",
-        UNCERTAIN_RECEIPT_RECHECKS,
+        tuning.uncertain_rechecks,
         fill.seq,
         tx_hash,
         last_error.unwrap_or_else(|| "receipt still pending".into())
@@ -268,18 +264,17 @@ async fn resolve_uncertain_settlement(
 fn hold_unresolved_settlement(
     engine: &mut Engine,
     fill: &FillCandidate,
-    err: &SettlementConfirmationError,
+    _err: &SettlementConfirmationError,
 ) {
-    record_settlement_confirmation_failure(engine, err);
-    engine.record_settlement_unknown_outcome();
     engine.mark_dirty(fill.buyer);
     engine.mark_dirty(fill.seller);
 }
 
 fn spawn_uncertain_settlement_reconciler(state: AppState, fill: FillCandidate, tx_hash: TxHash) {
     tokio::spawn(async move {
-        for attempt in 1..=DEFERRED_RECEIPT_RECHECKS {
-            tokio::time::sleep(DEFERRED_RECEIPT_RECHECK_INTERVAL).await;
+        let tuning = receipt_tuning();
+        for attempt in 1..=tuning.deferred_rechecks {
+            tokio::time::sleep(tuning.deferred_recheck_interval).await;
             match state.chain.settlement_receipt_status(tx_hash).await {
                 Ok(Some(SettlementReceiptStatus::Succeeded)) => {
                     eprintln!(
@@ -299,7 +294,7 @@ fn spawn_uncertain_settlement_reconciler(state: AppState, fill: FillCandidate, t
                 }
                 Ok(None) => {}
                 Err(err) => {
-                    if attempt == 1 || attempt == DEFERRED_RECEIPT_RECHECKS {
+                    if attempt == 1 || attempt == tuning.deferred_rechecks {
                         eprintln!(
                             "[settlement] deferred receipt still unresolved seq={} tx={} attempt={}: {err:#}",
                             fill.seq, tx_hash, attempt
@@ -311,7 +306,7 @@ fn spawn_uncertain_settlement_reconciler(state: AppState, fill: FillCandidate, t
 
         eprintln!(
             "[settlement] deferred receipt timed out seq={} tx={} checks={}; staling both orders",
-            fill.seq, tx_hash, DEFERRED_RECEIPT_RECHECKS
+            fill.seq, tx_hash, tuning.deferred_rechecks
         );
         let mut engine = state.engine.lock().await;
         time_out_unresolved_settlement(&mut engine, &fill);
@@ -319,6 +314,8 @@ fn spawn_uncertain_settlement_reconciler(state: AppState, fill: FillCandidate, t
 }
 
 fn time_out_unresolved_settlement(engine: &mut Engine, fill: &FillCandidate) {
+    engine.record_settlement_receipt_failed();
+    engine.record_settlement_unknown_outcome();
     engine.mark_dirty(fill.buyer);
     engine.mark_dirty(fill.seller);
     engine.abort_fill(fill, true, true);
@@ -383,9 +380,19 @@ pub(super) async fn refresh_for_settlement(state: &AppState, fill: &FillCandidat
     };
 
     let mut engine = state.engine.lock().await;
-    engine.apply_balance_refresh(fill.buyer, buyer_balances.0, buyer_balances.1);
+    engine.apply_balance_refresh_at_block(
+        fill.buyer,
+        buyer_balances.real,
+        buyer_balances.vault,
+        buyer_balances.block,
+    );
     if fill.seller != fill.buyer {
-        engine.apply_balance_refresh(fill.seller, seller_balances.0, seller_balances.1);
+        engine.apply_balance_refresh_at_block(
+            fill.seller,
+            seller_balances.real,
+            seller_balances.vault,
+            seller_balances.block,
+        );
     }
     engine.record_pre_settlement_balance_refreshes(refresh_count);
     Ok(())
@@ -432,9 +439,19 @@ async fn refresh_after_success(state: &AppState, fill: &FillCandidate) -> Result
     )?;
 
     let mut engine = state.engine.lock().await;
-    engine.apply_balance_refresh(fill.buyer, buyer_balances.0, buyer_balances.1);
+    engine.apply_balance_refresh_at_block(
+        fill.buyer,
+        buyer_balances.real,
+        buyer_balances.vault,
+        buyer_balances.block,
+    );
     if fill.seller != fill.buyer {
-        engine.apply_balance_refresh(fill.seller, seller_balances.0, seller_balances.1);
+        engine.apply_balance_refresh_at_block(
+            fill.seller,
+            seller_balances.real,
+            seller_balances.vault,
+            seller_balances.block,
+        );
     }
     Ok(())
 }
