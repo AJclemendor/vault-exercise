@@ -1,10 +1,8 @@
-use super::{
-    PendingSettlement, PostSubmitFailurePolicy, PreSubmitDecision, SubmitOutcome,
-};
+use super::{PendingSettlement, PostSubmitFailurePolicy, PreSubmitDecision, SubmitOutcome};
+use crate::AppState;
 use crate::chain::{SettlementConfirmationError, SettlementReceiptStatus};
 use crate::engine::{Engine, FillCandidate};
 use crate::sequencing::OrderedGate;
-use crate::AppState;
 use alloy::primitives::TxHash;
 use anyhow::Result;
 use std::sync::Arc;
@@ -361,10 +359,7 @@ async fn abort_confirmed_reverted_settlement_with_policy(
     }
 }
 
-pub(super) async fn refresh_for_settlement(
-    state: &AppState,
-    fill: &FillCandidate,
-) -> Result<()> {
+pub(super) async fn refresh_for_settlement(state: &AppState, fill: &FillCandidate) -> Result<()> {
     let (buyer_balances, seller_balances, refresh_count) = if fill.seller == fill.buyer {
         let balances = state.chain.read_user_balances(fill.buyer).await?;
         (balances, balances, 1)

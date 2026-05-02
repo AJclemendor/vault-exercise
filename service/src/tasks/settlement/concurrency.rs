@@ -1,6 +1,6 @@
 use alloy::primitives::Address;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 #[derive(Debug)]

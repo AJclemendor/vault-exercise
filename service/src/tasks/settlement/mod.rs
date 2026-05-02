@@ -1,9 +1,9 @@
 mod concurrency;
 mod outcome;
 
+use crate::AppState;
 use crate::engine::FillCandidate;
 use crate::sequencing::OrderedGate;
-use crate::AppState;
 use alloy::network::Ethereum;
 use alloy::providers::PendingTransactionBuilder;
 use concurrency::{PreSubmitReorderState, UserSettlementLocks};
