@@ -33,7 +33,7 @@ Read the contracts and harness source before writing code. The harness is your a
 
 Starts anvil, deploys contracts, builds both crates, runs the harness in the background, then runs your service in the foreground.
 
-### Manual (for development)
+### Manual (for debugging)
 
 ```bash
 # Terminal 1
