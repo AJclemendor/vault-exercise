@@ -22,6 +22,15 @@ impl Engine {
             .any(|order| order.user == user && order.is_live() && order.in_flight_size > U256::ZERO)
     }
 
+    pub(super) fn user_has_other_in_flight_order(&self, user: Address, order_id: &str) -> bool {
+        self.orders.values().any(|order| {
+            order.user == user
+                && order.id != order_id
+                && order.is_live()
+                && order.in_flight_size > U256::ZERO
+        })
+    }
+
     pub(crate) fn stale_other_live_orders_for_user(&mut self, user: Address, keep_order_id: &str) {
         let mut candidates: Vec<_> = self
             .orders

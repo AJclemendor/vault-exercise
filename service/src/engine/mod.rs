@@ -9,7 +9,7 @@ mod snapshot;
 use crate::stats::Stats;
 #[cfg(test)]
 use crate::types::{ApiError, SubmitOrderRequest};
-use crate::types::{OrderStatus, OrderType, OrderView, Side};
+use crate::types::{OrderResponse, OrderStatus, OrderType, OrderView, Side};
 use alloy::primitives::{Address, U256};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -100,6 +100,7 @@ pub(crate) struct Engine {
     bids: BTreeMap<U256, VecDeque<String>>,
     asks: BTreeMap<U256, VecDeque<String>>,
     balances: HashMap<Address, BalanceState>,
+    pending_fills: VecDeque<FillCandidate>,
     next_order_seq: u64,
     next_fill_seq: u64,
     stats: Stats,
@@ -112,6 +113,7 @@ impl Engine {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             balances: HashMap::new(),
+            pending_fills: VecDeque::new(),
             next_order_seq: 1,
             next_fill_seq: 1,
             stats: Stats::default(),
@@ -130,6 +132,11 @@ pub(crate) struct FillCandidate {
     pub(crate) exec_price: U256,
     pub(crate) quote: U256,
     pub(crate) base: U256,
+}
+
+pub(crate) struct OrderAdmission {
+    pub(crate) response: OrderResponse,
+    pub(crate) fills: Vec<FillCandidate>,
 }
 
 #[cfg(test)]

@@ -261,7 +261,9 @@ fn external_balance_drop_stales_overbooked_limits_that_no_longer_fit() {
 fn market_order_hard_lock_stales_limits_that_do_not_fit_residual_balance() {
     let mut engine = Engine::new();
     let buyer = address(1);
+    let seller = address(2);
     engine.apply_balance_refresh(buyer, wad(100), U256::ZERO);
+    engine.apply_balance_refresh(seller, wad(15), U256::ZERO);
 
     let first_limit = submit(
         &mut engine,
@@ -279,26 +281,36 @@ fn market_order_hard_lock_stales_limits_that_do_not_fit_residual_balance() {
         wad(1),
         wad(90),
     );
+    submit(
+        &mut engine,
+        seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(2),
+        wad(15),
+    );
     let market = submit(
         &mut engine,
         buyer,
         Side::Buy,
         OrderType::Market,
-        wad(1),
+        wad(2),
         wad(15),
     );
 
     assert_eq!(engine.orders[&market].status, OrderStatus::Open);
     assert_eq!(engine.orders[&first_limit].status, OrderStatus::Stale);
     assert_eq!(engine.orders[&second_limit].status, OrderStatus::Stale);
-    assert_eq!(engine.balance_view(buyer).reserved, wad(15));
+    assert_eq!(engine.balance_view(buyer).reserved, wad(30));
 }
 
 #[test]
 fn market_order_hard_lock_keeps_limits_that_fit_residual_balance() {
     let mut engine = Engine::new();
     let buyer = address(1);
+    let seller = address(2);
     engine.apply_balance_refresh(buyer, wad(100), U256::ZERO);
+    engine.apply_balance_refresh(seller, wad(5), U256::ZERO);
 
     let limit = submit(
         &mut engine,
@@ -308,13 +320,21 @@ fn market_order_hard_lock_keeps_limits_that_fit_residual_balance() {
         wad(1),
         wad(90),
     );
+    submit(
+        &mut engine,
+        seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(2),
+        wad(5),
+    );
     let market = submit(
         &mut engine,
         buyer,
         Side::Buy,
         OrderType::Market,
-        wad(1),
-        wad(10),
+        wad(2),
+        wad(5),
     );
 
     assert_eq!(engine.orders[&market].status, OrderStatus::Open);
@@ -326,8 +346,18 @@ fn market_order_hard_lock_keeps_limits_that_fit_residual_balance() {
 fn market_order_admission_counts_existing_market_locks() {
     let mut engine = Engine::new();
     let buyer = address(1);
+    let seller = address(2);
     engine.apply_balance_refresh(buyer, wad(100), U256::ZERO);
+    engine.apply_balance_refresh(seller, wad(90), U256::ZERO);
 
+    submit(
+        &mut engine,
+        seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(90),
+    );
     let first_market = submit(
         &mut engine,
         buyer,

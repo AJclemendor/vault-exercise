@@ -9,6 +9,9 @@ use super::{Engine, FillCandidate, Order};
 
 impl Engine {
     pub(crate) fn claim_next_fill_candidate(&mut self) -> Option<FillCandidate> {
+        if let Some(fill) = self.pending_fills.pop_front() {
+            return Some(fill);
+        }
         self.next_fill_candidate()
     }
 
@@ -24,6 +27,10 @@ impl Engine {
     }
 
     pub(crate) fn next_fill_candidate(&mut self) -> Option<FillCandidate> {
+        if let Some(fill) = self.pending_fills.pop_front() {
+            return Some(fill);
+        }
+
         loop {
             if let Some(market_id) = self.oldest_market_order() {
                 if let Some(counterparty_id) = self.find_market_counterparty(&market_id) {
@@ -39,6 +46,67 @@ impl Engine {
             let (buy_id, sell_id) = self.best_crossing_limits()?;
             return self.prepare_fill(&buy_id, &sell_id);
         }
+    }
+
+    pub(super) fn match_new_order(&mut self, order_id: &str) -> Vec<FillCandidate> {
+        let mut fills = Vec::new();
+
+        while self.order_can_take(order_id) {
+            let Some(counterparty_id) = self.find_taker_counterparty(order_id) else {
+                break;
+            };
+            let Some(fill) = self.prepare_taker_fill(order_id, &counterparty_id) else {
+                break;
+            };
+            fills.push(fill);
+        }
+
+        fills
+    }
+
+    fn order_can_take(&self, order_id: &str) -> bool {
+        self.orders
+            .get(order_id)
+            .map(|order| {
+                order.is_live()
+                    && order.available_remaining() > U256::ZERO
+                    && !self.user_has_other_in_flight_order(order.user, order_id)
+            })
+            .unwrap_or(false)
+    }
+
+    fn find_taker_counterparty(&mut self, order_id: &str) -> Option<String> {
+        let taker = self.orders.get(order_id)?.clone();
+        let (counterparty_side, prices): (Side, Vec<_>) = match taker.side {
+            Side::Buy => (
+                Side::Sell,
+                self.asks
+                    .range(..=taker.price)
+                    .map(|(price, _)| *price)
+                    .collect(),
+            ),
+            Side::Sell => (
+                Side::Buy,
+                self.bids
+                    .range(taker.price..)
+                    .rev()
+                    .map(|(price, _)| *price)
+                    .collect(),
+            ),
+        };
+
+        for price in prices {
+            for candidate_id in self.available_limit_ids_at_price(counterparty_side, price) {
+                let Some(candidate) = self.orders.get(&candidate_id) else {
+                    continue;
+                };
+                if candidate.user != taker.user {
+                    return Some(candidate_id);
+                }
+            }
+        }
+
+        None
     }
 
     fn oldest_market_order(&self) -> Option<String> {
@@ -125,6 +193,19 @@ impl Engine {
     }
 
     fn prepare_fill(&mut self, first_id: &str, second_id: &str) -> Option<FillCandidate> {
+        self.prepare_fill_with_taker(first_id, second_id, None)
+    }
+
+    fn prepare_taker_fill(&mut self, taker_id: &str, resting_id: &str) -> Option<FillCandidate> {
+        self.prepare_fill_with_taker(taker_id, resting_id, Some(taker_id))
+    }
+
+    fn prepare_fill_with_taker(
+        &mut self,
+        first_id: &str,
+        second_id: &str,
+        taker_id: Option<&str>,
+    ) -> Option<FillCandidate> {
         let first = self.orders.get(first_id)?;
         let second = self.orders.get(second_id)?;
         let (buy_id, sell_id) = match (first.side, second.side) {
@@ -138,7 +219,8 @@ impl Engine {
         if buy.user == sell.user {
             return None;
         }
-        if !buy.is_available_for_fill() || !sell.is_available_for_fill() {
+        if !self.order_is_fillable(&buy_id, taker_id) || !self.order_is_fillable(&sell_id, taker_id)
+        {
             return None;
         }
 
@@ -177,6 +259,20 @@ impl Engine {
 
         self.stats.fill_candidates += 1;
         Some(candidate)
+    }
+
+    fn order_is_fillable(&self, order_id: &str, taker_id: Option<&str>) -> bool {
+        let Some(order) = self.orders.get(order_id) else {
+            return false;
+        };
+
+        if taker_id == Some(order_id) {
+            return order.is_live()
+                && order.available_remaining() > U256::ZERO
+                && !self.user_has_other_in_flight_order(order.user, order_id);
+        }
+
+        order.is_available_for_fill() && !self.user_has_in_flight_order(order.user)
     }
 
     pub(crate) fn fill_still_pending(&self, fill: &FillCandidate) -> bool {
@@ -301,7 +397,7 @@ impl Engine {
                 order.cancel_requested = false;
             } else {
                 order.status = OrderStatus::PartiallyFilled;
-                cancel_after_fill = order.cancel_requested;
+                cancel_after_fill = order.cancel_requested && order.in_flight_size.is_zero();
             }
 
             let new_required = if order.is_live() {

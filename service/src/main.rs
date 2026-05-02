@@ -7,7 +7,7 @@ mod tasks;
 mod types;
 
 use crate::chain::ChainClient;
-use crate::engine::Engine;
+use crate::engine::{Engine, FillCandidate};
 use crate::sequencing::AdmissionSequencer;
 use anyhow::{Context, Result};
 use axum::Router;
@@ -15,7 +15,7 @@ use axum::routing::{delete, get, post};
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinError;
 
 const LISTEN_ADDR: &str = "127.0.0.1:8080";
@@ -46,6 +46,7 @@ pub(crate) struct AppState {
     pub(crate) engine: Arc<Mutex<Engine>>,
     pub(crate) chain: ChainClient,
     pub(crate) admission: Arc<AdmissionSequencer>,
+    pub(crate) settlement_queue: mpsc::UnboundedSender<FillCandidate>,
 }
 
 #[tokio::main]
@@ -57,13 +58,15 @@ async fn main() -> Result<()> {
         config.vault_address,
         config.operator_key,
     )?;
+    let (settlement_queue, settlement_rx) = mpsc::unbounded_channel();
     let state = AppState {
         engine: Arc::new(Mutex::new(Engine::new())),
         chain,
         admission: Arc::new(AdmissionSequencer::new()),
+        settlement_queue,
     };
 
-    spawn_background_tasks(state.clone());
+    spawn_background_tasks(state.clone(), settlement_rx);
 
     let app = Router::new()
         .route(
@@ -83,8 +86,8 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn spawn_background_tasks(state: AppState) {
-    let settlement = tokio::spawn(tasks::settlement_loop(state.clone()));
+fn spawn_background_tasks(state: AppState, settlement_rx: mpsc::UnboundedReceiver<FillCandidate>) {
+    let settlement = tokio::spawn(tasks::settlement_loop(state.clone(), settlement_rx));
     let active_refresh = tokio::spawn(tasks::active_refresh_loop(state.clone()));
     let log_poll = tokio::spawn(tasks::log_poll_loop(state.clone()));
     let stats_log = tokio::spawn(tasks::stats_log_loop(state));

@@ -5,13 +5,32 @@ use crate::types::{
 };
 
 use super::math::{reservation_for, sub_or_zero};
-use super::{Engine, Order};
+use super::{Engine, Order, OrderAdmission};
 
 impl Engine {
     pub(crate) fn submit_order(
         &mut self,
         request: SubmitOrderRequest,
     ) -> std::result::Result<OrderResponse, ApiError> {
+        let admission = self.submit_order_and_match(request)?;
+        self.pending_fills.extend(admission.fills);
+        Ok(admission.response)
+    }
+
+    pub(crate) fn submit_order_and_claim_fills(
+        &mut self,
+        request: SubmitOrderRequest,
+    ) -> std::result::Result<OrderAdmission, ApiError> {
+        let previous_pending = self.pending_fills.len();
+        let response = self.submit_order(request)?;
+        let fills = self.pending_fills.drain(previous_pending..).collect();
+        Ok(OrderAdmission { response, fills })
+    }
+
+    fn submit_order_and_match(
+        &mut self,
+        request: SubmitOrderRequest,
+    ) -> std::result::Result<OrderAdmission, ApiError> {
         self.stats.orders_received += 1;
 
         if request.size.is_zero() {
@@ -72,18 +91,39 @@ impl Engine {
             matched_once: false,
         };
         self.next_order_seq += 1;
-        if order.order_type == OrderType::Limit {
-            self.index_limit_order(order.side, order.price, id.clone());
-        }
         self.orders.insert(id.clone(), order);
+
+        let fills = self.match_new_order(&id);
+        let order_type = self
+            .orders
+            .get(&id)
+            .map(|order| order.order_type)
+            .expect("submitted order should exist");
+        if order_type == OrderType::Limit {
+            let (side, price) = self
+                .orders
+                .get(&id)
+                .map(|order| (order.side, order.price))
+                .expect("submitted order should exist");
+            self.index_limit_order(side, price, id.clone());
+        }
         if request.order_type == OrderType::Market {
+            self.cancel_unfilled_market_remainder(&id);
             self.prune_user_to_balance(request.user, Some(id.clone()));
         }
         self.stats.orders_accepted += 1;
+        let status = self
+            .orders
+            .get(&id)
+            .map(|order| order.status)
+            .unwrap_or(OrderStatus::Cancelled);
 
-        Ok(OrderResponse {
-            order_id: id,
-            status: OrderStatus::Open,
+        Ok(OrderAdmission {
+            response: OrderResponse {
+                order_id: id,
+                status,
+            },
+            fills,
         })
     }
 
@@ -149,6 +189,31 @@ impl Engine {
     pub(super) fn release_user_reservation(&mut self, user: Address, amount: U256) {
         let balance = self.balances.entry(user).or_default();
         balance.reserved = sub_or_zero(balance.reserved, amount);
+    }
+
+    fn cancel_unfilled_market_remainder(&mut self, order_id: &str) {
+        let Some(order_snapshot) = self.orders.get(order_id).cloned() else {
+            return;
+        };
+        if order_snapshot.order_type != OrderType::Market || !order_snapshot.is_live() {
+            return;
+        }
+
+        if order_snapshot.in_flight_size.is_zero() {
+            self.terminal_order(order_id, OrderStatus::Cancelled);
+            return;
+        }
+
+        let retained_size = order_snapshot.filled_size + order_snapshot.in_flight_size;
+        let release_size = sub_or_zero(order_snapshot.size, retained_size);
+        let release = reservation_for(order_snapshot.side, order_snapshot.price, release_size)
+            .expect("stored order reservation should be bounded");
+
+        if let Some(order) = self.orders.get_mut(order_id) {
+            order.size = retained_size;
+            order.cancel_requested = true;
+        }
+        self.release_user_reservation(order_snapshot.user, release);
     }
 
     fn record_order_rejected_bad_request(&mut self) {
