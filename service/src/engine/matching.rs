@@ -353,10 +353,8 @@ impl Engine {
         let matched_orders = self.apply_order_fill(&fill.buy_id, fill.fill_size) as u64
             + self.apply_order_fill(&fill.sell_id, fill.fill_size) as u64;
 
-        self.stale_other_live_orders_for_user(fill.buyer, &fill.buy_id);
         self.stale_unsafe_live_orders_for_user(fill.buyer, None);
         if fill.seller != fill.buyer {
-            self.stale_other_live_orders_for_user(fill.seller, &fill.sell_id);
             self.stale_unsafe_live_orders_for_user(fill.seller, None);
         }
 

@@ -146,7 +146,42 @@ fn market_order_matches_older_resting_limit_from_indexed_book() {
 }
 
 #[test]
-fn precheck_allows_overbooked_competing_limit_until_fill_succeeds() {
+fn currently_open_orders_include_inflight_market_remainders() {
+    let mut engine = Engine::new();
+    let buyer = address(1);
+    let seller = address(2);
+    engine.apply_balance_refresh(buyer, wad(20), U256::ZERO);
+    engine.apply_balance_refresh(seller, wad(10), U256::ZERO);
+
+    submit(
+        &mut engine,
+        seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(5),
+    );
+    let admission = engine
+        .submit_order_and_claim_fills(SubmitOrderRequest {
+            user: buyer,
+            side: Side::Buy,
+            order_type: OrderType::Market,
+            price: wad(1),
+            size: wad(10),
+        })
+        .expect("market order should be accepted");
+
+    assert_eq!(admission.fills.len(), 1);
+    assert!(engine.open_orders(Some(buyer)).is_empty());
+
+    let snapshot = engine.stats_snapshot();
+    assert_eq!(snapshot.currently_open_orders, 2);
+    assert_eq!(snapshot.currently_open_status_orders, 2);
+    assert_eq!(snapshot.currently_partially_filled_orders, 0);
+}
+
+#[test]
+fn settlement_success_preserves_competing_limit_that_still_fits_balance() {
     let mut engine = Engine::new();
     let buyer = address(1);
     let seller = address(2);
@@ -194,7 +229,7 @@ fn precheck_allows_overbooked_competing_limit_until_fill_succeeds() {
     engine.apply_settlement_success(&fill);
 
     assert_eq!(engine.orders[&older_buy_id].status, OrderStatus::Filled);
-    assert_eq!(engine.orders[&newer_buy_id].status, OrderStatus::Stale);
+    assert_eq!(engine.orders[&newer_buy_id].status, OrderStatus::Open);
 }
 
 #[test]
@@ -518,6 +553,62 @@ fn settlement_success_uses_refreshed_chain_balances_and_counts_matched_orders_on
     assert_eq!(snapshot.fill_sides_successfully_settled, 2);
     assert_eq!(snapshot.fills_settled, 1);
     assert_eq!(snapshot.fills_successfully_settled, 1);
+}
+
+#[test]
+fn settlement_success_preserves_funded_sibling_orders_and_stales_only_unsafe_orders() {
+    let mut engine = Engine::new();
+    let buyer = address(1);
+    let seller = address(2);
+    engine.apply_balance_refresh(buyer, wad(15), U256::ZERO);
+    engine.apply_balance_refresh(seller, wad(10), U256::ZERO);
+
+    let filled_buy_id = submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+    let funded_sibling_id = submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(5),
+    );
+    let unsafe_sibling_id = submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(6),
+    );
+    let sell_id = submit(
+        &mut engine,
+        seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+
+    let fill = engine.next_fill_candidate().expect("orders should cross");
+    assert_eq!(fill.buy_id, filled_buy_id);
+    assert_eq!(fill.sell_id, sell_id);
+
+    engine.apply_balance_refresh(buyer, wad(5), wad(10));
+    engine.apply_balance_refresh(seller, U256::ZERO, wad(10));
+    engine.apply_settlement_success(&fill);
+
+    assert_eq!(engine.orders[&filled_buy_id].status, OrderStatus::Filled);
+    assert_eq!(engine.orders[&funded_sibling_id].status, OrderStatus::Open);
+    assert_eq!(engine.orders[&unsafe_sibling_id].status, OrderStatus::Stale);
+    assert_eq!(engine.balance_view(buyer).reserved, wad(5));
+    assert_eq!(engine.stats.orders_marked_stale, 1);
 }
 
 #[test]

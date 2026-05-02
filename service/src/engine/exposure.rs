@@ -31,25 +31,6 @@ impl Engine {
         })
     }
 
-    pub(crate) fn stale_other_live_orders_for_user(&mut self, user: Address, keep_order_id: &str) {
-        let mut candidates: Vec<_> = self
-            .orders
-            .values()
-            .filter(|order| {
-                order.user == user
-                    && order.id != keep_order_id
-                    && order.is_live()
-                    && order.in_flight_size.is_zero()
-            })
-            .map(|order| (Reverse(order.created_seq), order.id.clone()))
-            .collect();
-        candidates.sort_by_key(|candidate| candidate.0);
-
-        for (_, order_id) in candidates {
-            self.terminal_order(&order_id, OrderStatus::Stale);
-        }
-    }
-
     pub(crate) fn stale_unsafe_live_orders_for_user(
         &mut self,
         user: Address,
