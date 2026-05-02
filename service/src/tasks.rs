@@ -117,7 +117,7 @@ pub(crate) async fn stats_log_loop(state: AppState) {
                 "  settlements_attempted {}/{} {} of candidates (fill_candidates={} precheck_passed={}/{} {} precheck_failed={}/{} {} tx_attempts={}/{} {} tx_submitted={}/{} {})\n",
                 "  settlements_reverted  {} {} of tx_attempts (receipt_status_reverted={})\n",
                 "  settlement_outcomes   success={} reverted={} send_fail={} receipt_fail={} precheck_fail={} unknown={} pending={} unattempted={}\n",
-                "  currently_open_orders {} {} of accepted {} (open_status={} partial_status={})",
+                "  currently_open_orders {} live (open_status={} partial_status={}; lifetime_accepted_pct={})",
             ),
             ANSI_CYAN,
             ANSI_RESET,
@@ -174,10 +174,9 @@ pub(crate) async fn stats_log_loop(state: AppState) {
             paint(settlement_pending_attempted, settlement_pending_color),
             paint(settlement_unattempted, settlement_unattempted_color),
             stat_count(snapshot.currently_open_orders as u64, ANSI_CYAN),
-            stat_pct(snapshot.currently_open_orders_pct_of_accepted, ANSI_CYAN),
-            pct_bar_colored(snapshot.currently_open_orders_pct_of_accepted, ANSI_CYAN),
             paint(snapshot.currently_open_status_orders, ANSI_CYAN),
             paint(snapshot.currently_partially_filled_orders, ANSI_CYAN),
+            stat_pct(snapshot.currently_open_orders_pct_of_accepted, ANSI_DIM),
         );
     }
 }
