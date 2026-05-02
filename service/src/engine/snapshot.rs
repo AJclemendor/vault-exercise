@@ -1,6 +1,6 @@
 use alloy::primitives::U256;
 
-use crate::stats::{StatsSnapshot, pct};
+use crate::stats::{StatsSnapshot, pct, ratio};
 use crate::types::{OrderStatus, OrderType};
 
 use super::Engine;
@@ -72,6 +72,19 @@ impl Engine {
             + self.stats.settlement_receipt_failures
             + self.stats.settlements_reverted;
         let settlement_failures = self.stats.settlements_precheck_failed + settlement_tx_failures;
+        let settlement_precheck_passed = self
+            .stats
+            .settlements_attempted
+            .saturating_sub(self.stats.settlements_precheck_failed);
+        let settlement_tx_submitted = self
+            .stats
+            .settlement_tx_attempts
+            .saturating_sub(self.stats.settlement_send_failures);
+        let settlement_terminal_outcomes = self.stats.successful_settlements + settlement_failures;
+        let settlement_pending_outcomes = self
+            .stats
+            .fill_candidates
+            .saturating_sub(settlement_terminal_outcomes + self.stats.settlement_unknown_outcomes);
 
         StatsSnapshot {
             orders_received: self.stats.orders_received,
@@ -104,17 +117,31 @@ impl Engine {
                 self.stats.orders_failed_balance_refresh,
                 self.stats.orders_received,
             ),
-            orders_matched: self.stats.order_sides_filled,
+            orders_matched: self.stats.unique_orders_with_successful_fill,
             orders_with_successful_fill: self.stats.unique_orders_with_successful_fill,
+            unique_orders_filled: self.stats.unique_orders_with_successful_fill,
+            unique_orders_filled_pct_of_accepted: pct(
+                self.stats.unique_orders_with_successful_fill,
+                self.stats.orders_accepted,
+            ),
             unique_orders_with_successful_fill: self.stats.unique_orders_with_successful_fill,
             order_sides_filled: self.stats.order_sides_filled,
+            order_fill_side_events: self.stats.order_sides_filled,
+            order_fill_side_events_per_accepted_order: ratio(
+                self.stats.order_sides_filled,
+                self.stats.orders_accepted,
+            ),
             fill_sides_successfully_settled: self.stats.order_sides_filled,
             market_ioc_orders_accepted,
             market_ioc_orders_cancelled_unfilled,
             currently_open_market_ioc_orders: open_market_ioc_orders,
             fill_candidates: self.stats.fill_candidates,
+            fill_candidates_pct_of_settlements_attempted: pct(
+                self.stats.fill_candidates,
+                self.stats.settlements_attempted,
+            ),
             orders_matched_pct_of_accepted: pct(
-                self.stats.order_sides_filled,
+                self.stats.unique_orders_with_successful_fill,
                 self.stats.orders_accepted,
             ),
             unique_orders_with_successful_fill_pct_of_accepted: pct(
@@ -123,7 +150,21 @@ impl Engine {
             ),
             settlements_attempted: self.stats.settlements_attempted,
             settlement_precheck_attempts: self.stats.settlements_attempted,
+            settlement_precheck_passed,
+            settlement_precheck_passed_pct: pct(
+                settlement_precheck_passed,
+                self.stats.settlements_attempted,
+            ),
             settlement_tx_attempts: self.stats.settlement_tx_attempts,
+            settlement_tx_attempts_pct_of_attempted: pct(
+                self.stats.settlement_tx_attempts,
+                self.stats.settlements_attempted,
+            ),
+            settlement_tx_submitted,
+            settlement_tx_submitted_pct_of_attempts: pct(
+                settlement_tx_submitted,
+                self.stats.settlement_tx_attempts,
+            ),
             settlement_failures,
             settlement_failures_pct: pct(settlement_failures, self.stats.settlements_attempted),
             settlement_tx_failures,
@@ -151,6 +192,9 @@ impl Engine {
             settlement_reverts: self.stats.settlements_reverted,
             settlement_receipt_status_reverted: self.stats.settlements_reverted,
             settlement_tx_reverts: self.stats.settlements_reverted,
+            settlement_receipt_successes: self.stats.successful_settlements,
+            settlement_terminal_outcomes,
+            settlement_pending_outcomes,
             settlement_unknown_outcomes: self.stats.settlement_unknown_outcomes,
             settlements_reverted_pct: pct(
                 self.stats.settlements_reverted,

@@ -320,8 +320,10 @@ fn settlement_success_uses_refreshed_chain_balances_and_counts_matched_orders_on
     let snapshot = engine.stats_snapshot();
     assert_eq!(snapshot.orders_matched, 2);
     assert_eq!(snapshot.orders_with_successful_fill, 2);
+    assert_eq!(snapshot.unique_orders_filled, 2);
     assert_eq!(snapshot.unique_orders_with_successful_fill, 2);
     assert_eq!(snapshot.order_sides_filled, 2);
+    assert_eq!(snapshot.order_fill_side_events, 2);
     assert_eq!(snapshot.fill_sides_successfully_settled, 2);
     assert_eq!(snapshot.fills_settled, 1);
     assert_eq!(snapshot.fills_successfully_settled, 1);
@@ -382,10 +384,12 @@ fn repeated_partial_fills_do_not_double_count_the_same_matched_order() {
     assert_eq!(engine.stats.order_sides_filled, 4);
     assert_eq!(engine.stats.successful_settlements, 2);
     let snapshot = engine.stats_snapshot();
-    assert_eq!(snapshot.orders_matched, 4);
+    assert_eq!(snapshot.orders_matched, 3);
     assert_eq!(snapshot.orders_with_successful_fill, 3);
+    assert_eq!(snapshot.unique_orders_filled, 3);
     assert_eq!(snapshot.unique_orders_with_successful_fill, 3);
     assert_eq!(snapshot.order_sides_filled, 4);
+    assert_eq!(snapshot.order_fill_side_events, 4);
     assert_eq!(snapshot.fill_sides_successfully_settled, 4);
     assert_eq!(snapshot.fills_settled, 2);
     assert_eq!(snapshot.fills_successfully_settled, 2);
@@ -502,6 +506,8 @@ fn settlement_failure_stats_are_split_by_failure_class() {
     let snapshot = engine.stats_snapshot();
     assert_eq!(snapshot.settlement_tx_attempts, 3);
     assert_eq!(snapshot.settlement_precheck_attempts, 0);
+    assert_eq!(snapshot.settlement_precheck_passed, 0);
+    assert_eq!(snapshot.settlement_tx_submitted, 2);
     assert_eq!(snapshot.settlement_send_failures, 1);
     assert_eq!(snapshot.settlement_receipt_failures, 1);
     assert_eq!(snapshot.settlements_reverted, 1);
@@ -512,6 +518,8 @@ fn settlement_failure_stats_are_split_by_failure_class() {
     assert_eq!(snapshot.settlement_tx_failures, 3);
     assert_eq!(snapshot.settlement_tx_failures_pct, 100.0);
     assert_eq!(snapshot.settlement_failures, 3);
+    assert_eq!(snapshot.settlement_terminal_outcomes, 3);
+    assert_eq!(snapshot.settlement_pending_outcomes, 0);
     assert_eq!(snapshot.settlement_unknown_outcomes, 1);
 }
 

@@ -46,18 +46,28 @@ pub(crate) struct StatsSnapshot {
     pub(crate) orders_failed_balance_refresh_pct: f64,
     pub(crate) orders_matched: u64,
     pub(crate) orders_with_successful_fill: u64,
+    pub(crate) unique_orders_filled: u64,
+    pub(crate) unique_orders_filled_pct_of_accepted: f64,
     pub(crate) unique_orders_with_successful_fill: u64,
     pub(crate) order_sides_filled: u64,
+    pub(crate) order_fill_side_events: u64,
+    pub(crate) order_fill_side_events_per_accepted_order: f64,
     pub(crate) fill_sides_successfully_settled: u64,
     pub(crate) market_ioc_orders_accepted: u64,
     pub(crate) market_ioc_orders_cancelled_unfilled: usize,
     pub(crate) currently_open_market_ioc_orders: usize,
     pub(crate) fill_candidates: u64,
+    pub(crate) fill_candidates_pct_of_settlements_attempted: f64,
     pub(crate) orders_matched_pct_of_accepted: f64,
     pub(crate) unique_orders_with_successful_fill_pct_of_accepted: f64,
     pub(crate) settlements_attempted: u64,
     pub(crate) settlement_precheck_attempts: u64,
+    pub(crate) settlement_precheck_passed: u64,
+    pub(crate) settlement_precheck_passed_pct: f64,
     pub(crate) settlement_tx_attempts: u64,
+    pub(crate) settlement_tx_attempts_pct_of_attempted: f64,
+    pub(crate) settlement_tx_submitted: u64,
+    pub(crate) settlement_tx_submitted_pct_of_attempts: f64,
     pub(crate) settlement_failures: u64,
     pub(crate) settlement_failures_pct: f64,
     pub(crate) settlement_tx_failures: u64,
@@ -73,6 +83,9 @@ pub(crate) struct StatsSnapshot {
     pub(crate) settlement_reverts: u64,
     pub(crate) settlement_receipt_status_reverted: u64,
     pub(crate) settlement_tx_reverts: u64,
+    pub(crate) settlement_receipt_successes: u64,
+    pub(crate) settlement_terminal_outcomes: u64,
+    pub(crate) settlement_pending_outcomes: u64,
     pub(crate) settlement_unknown_outcomes: u64,
     pub(crate) settlements_reverted_pct: f64,
     pub(crate) currently_open_orders: usize,
@@ -106,5 +119,13 @@ pub(crate) fn pct(numerator: u64, denominator: u64) -> f64 {
         0.0
     } else {
         numerator as f64 * 100.0 / denominator as f64
+    }
+}
+
+pub(crate) fn ratio(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
     }
 }
