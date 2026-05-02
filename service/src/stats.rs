@@ -1,0 +1,68 @@
+use serde::Serialize;
+
+#[derive(Debug, Default, Clone)]
+pub(crate) struct Stats {
+    pub(crate) orders_received: u64,
+    pub(crate) orders_accepted: u64,
+    pub(crate) orders_rejected: u64,
+    pub(crate) orders_matched: u64,
+    pub(crate) fill_candidates: u64,
+    pub(crate) settlements_attempted: u64,
+    pub(crate) settlement_tx_attempts: u64,
+    pub(crate) settlements_precheck_failed: u64,
+    pub(crate) settlements_reverted: u64,
+    pub(crate) successful_settlements: u64,
+    pub(crate) orders_marked_stale: u64,
+    pub(crate) admission_balance_refreshes: u64,
+    pub(crate) pre_settlement_balance_refreshes: u64,
+    pub(crate) background_balance_refreshes: u64,
+    pub(crate) cache_dirty_events: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct StatsSnapshot {
+    pub(crate) orders_received: u64,
+    pub(crate) orders_accepted: u64,
+    pub(crate) orders_accepted_pct: f64,
+    pub(crate) orders_rejected: u64,
+    pub(crate) orders_rejected_pct: f64,
+    pub(crate) orders_matched: u64,
+    pub(crate) fill_candidates: u64,
+    pub(crate) orders_matched_pct_of_accepted: f64,
+    pub(crate) settlements_attempted: u64,
+    pub(crate) settlement_tx_attempts: u64,
+    pub(crate) settlements_precheck_failed: u64,
+    pub(crate) settlements_precheck_failed_pct: f64,
+    pub(crate) settlements_reverted: u64,
+    pub(crate) settlements_reverted_pct: f64,
+    pub(crate) currently_open_orders: usize,
+    pub(crate) currently_open_orders_pct_of_accepted: f64,
+    pub(crate) currently_live_orders: usize,
+    pub(crate) currently_live_orders_pct_of_accepted: f64,
+    pub(crate) currently_open_status_orders: usize,
+    pub(crate) currently_partially_filled_orders: usize,
+    pub(crate) currently_filled_orders: usize,
+    pub(crate) currently_filled_orders_pct_of_accepted: f64,
+    pub(crate) currently_cancelled_orders: usize,
+    pub(crate) currently_stale_orders: usize,
+    pub(crate) currently_stale_orders_pct_of_accepted: f64,
+    pub(crate) successful_settlements: u64,
+    pub(crate) successful_settlements_pct: f64,
+    pub(crate) successful_settlements_pct_of_candidates: f64,
+    pub(crate) successful_settlements_pct_of_accepted: f64,
+    pub(crate) orders_marked_stale: u64,
+    pub(crate) orders_marked_stale_pct_of_accepted: f64,
+    pub(crate) admission_balance_refreshes: u64,
+    pub(crate) pre_settlement_balance_refreshes: u64,
+    pub(crate) background_balance_refreshes: u64,
+    pub(crate) cache_dirty_events: u64,
+    pub(crate) average_active_cache_age_ms: u64,
+}
+
+pub(crate) fn pct(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 * 100.0 / denominator as f64
+    }
+}
