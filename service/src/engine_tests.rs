@@ -612,7 +612,7 @@ fn settlement_success_preserves_funded_sibling_orders_and_stales_only_unsafe_ord
 }
 
 #[test]
-fn settlement_snapshot_does_not_exceed_candidate_denominator_before_precheck() {
+fn settlement_snapshot_reports_candidates_separately_from_attempts() {
     let mut engine = Engine::new();
     let buyer = address(1);
     let seller = address(2);
@@ -640,8 +640,8 @@ fn settlement_snapshot_does_not_exceed_candidate_denominator_before_precheck() {
     let snapshot = engine.stats_snapshot();
 
     assert_eq!(snapshot.fill_candidates, 1);
-    assert_eq!(snapshot.settlements_attempted, 1);
-    assert_eq!(snapshot.fill_candidates_pct_of_settlements_attempted, 100.0);
+    assert_eq!(snapshot.settlements_attempted, 0);
+    assert_eq!(snapshot.settlements_attempted_pct_of_candidates, 0.0);
     assert_eq!(snapshot.settlement_precheck_attempts, 0);
     assert_eq!(snapshot.settlement_precheck_attempts_pct_of_candidates, 0.0);
 }

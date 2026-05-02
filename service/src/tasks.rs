@@ -102,7 +102,7 @@ pub(crate) async fn stats_log_loop(state: AppState) {
                 "  orders_accepted       {}/{} {} {}\n",
                 "  orders_rejected       {}/{} {} {} (admission_failures={} bad_req={} insuff={} stale_cache={} refresh_fail={})\n",
                 "  orders_matched        {}/{} {} {} (unique orders with >=1 successful fill; fill_side_events={})\n",
-                "  settlements_attempted {} (fill_candidates={}/{} {} precheck_attempted={}/{} {} precheck_passed={}/{} {} precheck_failed={}/{} {} tx_attempts={}/{} {} tx_submitted={}/{} {})\n",
+                "  settlements_attempted {}/{} {} of candidates (fill_candidates={} precheck_passed={}/{} {} precheck_failed={}/{} {} tx_attempts={}/{} {} tx_submitted={}/{} {})\n",
                 "  settlements_reverted  {} {} of tx_attempts (receipt_status_reverted={})\n",
                 "  currently_open_orders {} {} of accepted {} (open_status={} partial_status={})",
             ),
@@ -132,17 +132,8 @@ pub(crate) async fn stats_log_loop(state: AppState) {
             paint(snapshot.order_fill_side_events, ANSI_CYAN),
             stat_count(snapshot.settlements_attempted, ANSI_DIM),
             paint(snapshot.fill_candidates, ANSI_CYAN),
-            paint(snapshot.settlements_attempted, ANSI_DIM),
-            stat_pct(
-                snapshot.fill_candidates_pct_of_settlements_attempted,
-                ANSI_CYAN
-            ),
-            paint(snapshot.settlement_precheck_attempts, ANSI_DIM),
-            paint(snapshot.settlements_attempted, ANSI_DIM),
-            stat_pct(
-                snapshot.settlement_precheck_attempts_pct_of_candidates,
-                ANSI_DIM
-            ),
+            stat_pct(snapshot.settlements_attempted_pct_of_candidates, ANSI_DIM),
+            paint(snapshot.fill_candidates, ANSI_CYAN),
             paint(snapshot.settlement_precheck_passed, ANSI_GREEN),
             paint(snapshot.settlement_precheck_attempts, ANSI_DIM),
             stat_pct(snapshot.settlement_precheck_passed_pct, ANSI_GREEN),
