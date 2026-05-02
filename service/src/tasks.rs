@@ -94,6 +94,14 @@ pub(crate) async fn stats_log_loop(state: AppState) {
         };
         let rejected_color = nonzero_color(snapshot.orders_rejected, ANSI_YELLOW);
         let revert_color = nonzero_color(snapshot.settlements_reverted, ANSI_RED);
+        let settlement_unattempted = snapshot
+            .fill_candidates
+            .saturating_sub(snapshot.settlements_attempted);
+        let settlement_pending_attempted = snapshot
+            .settlement_pending_outcomes
+            .saturating_sub(settlement_unattempted);
+        let settlement_pending_color = nonzero_color(settlement_pending_attempted, ANSI_YELLOW);
+        let settlement_unattempted_color = nonzero_color(settlement_unattempted, ANSI_YELLOW);
 
         println!(
             concat!(
@@ -104,6 +112,7 @@ pub(crate) async fn stats_log_loop(state: AppState) {
                 "  orders_matched        {}/{} {} {} (unique orders with >=1 successful fill; fill_side_events={})\n",
                 "  settlements_attempted {}/{} {} of candidates (fill_candidates={} precheck_passed={}/{} {} precheck_failed={}/{} {} tx_attempts={}/{} {} tx_submitted={}/{} {})\n",
                 "  settlements_reverted  {} {} of tx_attempts (receipt_status_reverted={})\n",
+                "  settlement_outcomes   success={} reverted={} send_fail={} receipt_fail={} precheck_fail={} unknown={} pending={} unattempted={}\n",
                 "  currently_open_orders {} {} of accepted {} (open_status={} partial_status={})",
             ),
             ANSI_CYAN,
@@ -152,6 +161,14 @@ pub(crate) async fn stats_log_loop(state: AppState) {
             stat_count(snapshot.settlements_reverted, revert_color),
             stat_pct(snapshot.settlements_reverted_pct, revert_color),
             paint(snapshot.settlement_receipt_status_reverted, revert_color),
+            paint(snapshot.successful_settlements, ANSI_GREEN),
+            paint(snapshot.settlements_reverted, revert_color),
+            paint(snapshot.settlement_send_failures, rejected_color),
+            paint(snapshot.settlement_receipt_failures, rejected_color),
+            paint(snapshot.settlements_precheck_failed, rejected_color),
+            paint(snapshot.settlement_unknown_outcomes, ANSI_YELLOW),
+            paint(settlement_pending_attempted, settlement_pending_color),
+            paint(settlement_unattempted, settlement_unattempted_color),
             stat_count(snapshot.currently_open_orders as u64, ANSI_CYAN),
             stat_pct(snapshot.currently_open_orders_pct_of_accepted, ANSI_CYAN),
             pct_bar_colored(snapshot.currently_open_orders_pct_of_accepted, ANSI_CYAN),
