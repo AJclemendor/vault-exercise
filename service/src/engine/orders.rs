@@ -104,6 +104,7 @@ impl Engine {
         };
         self.next_order_seq += 1;
         self.orders.insert(id.clone(), order);
+        self.track_live_order(request.user, id.clone());
 
         let fills = self.match_new_order(&id);
         let order_type = self
@@ -190,6 +191,8 @@ impl Engine {
             order.status = status;
             order.cancel_requested = false;
         }
+        self.clear_order_in_flight(order_snapshot.user, order_snapshot.in_flight_size);
+        self.untrack_live_order(order_snapshot.user, order_id);
 
         self.release_user_reservation(order_snapshot.user, release);
 
@@ -201,6 +204,105 @@ impl Engine {
     pub(super) fn release_user_reservation(&mut self, user: Address, amount: U256) {
         let balance = self.balances.entry(user).or_default();
         balance.reserved = sub_or_zero(balance.reserved, amount);
+    }
+
+    pub(super) fn track_live_order(&mut self, user: Address, order_id: String) {
+        self.live_order_ids_by_user
+            .entry(user)
+            .or_default()
+            .insert(order_id);
+    }
+
+    pub(super) fn untrack_live_order(&mut self, user: Address, order_id: &str) {
+        if let Some(order_ids) = self.live_order_ids_by_user.get_mut(&user) {
+            order_ids.remove(order_id);
+            if order_ids.is_empty() {
+                self.live_order_ids_by_user.remove(&user);
+            }
+        }
+    }
+
+    pub(super) fn live_order_ids_for_user(&self, user: Address) -> Vec<String> {
+        let mut order_ids: Vec<_> = self
+            .live_order_ids_by_user
+            .get(&user)
+            .map(|ids| ids.iter().cloned().collect())
+            .unwrap_or_else(|| {
+                self.orders
+                    .values()
+                    .filter(|order| order.user == user && order.is_live())
+                    .map(|order| order.id.clone())
+                    .collect()
+            });
+        order_ids.sort_by_key(|order_id| {
+            self.orders
+                .get(order_id)
+                .map(|order| order.created_seq)
+                .unwrap_or(u64::MAX)
+        });
+        order_ids
+    }
+
+    pub(super) fn add_order_in_flight(&mut self, order_id: &str, amount: U256) {
+        let transition = {
+            let Some(order) = self.orders.get_mut(order_id) else {
+                return;
+            };
+            let was_in_flight = order.is_live() && order.in_flight_size > U256::ZERO;
+            order.in_flight_size += amount;
+            let is_in_flight = order.is_live() && order.in_flight_size > U256::ZERO;
+            (order.user, was_in_flight, is_in_flight)
+        };
+        self.apply_in_flight_transition(transition);
+    }
+
+    pub(super) fn subtract_order_in_flight(&mut self, order_id: &str, amount: U256) -> bool {
+        let transition_and_cancel = {
+            let Some(order) = self.orders.get_mut(order_id) else {
+                return false;
+            };
+            let was_in_flight = order.is_live() && order.in_flight_size > U256::ZERO;
+            order.in_flight_size = sub_or_zero(order.in_flight_size, amount);
+            let is_in_flight = order.is_live() && order.in_flight_size > U256::ZERO;
+            let cancel_after_release = order.cancel_requested && order.in_flight_size.is_zero();
+            (
+                order.user,
+                was_in_flight,
+                is_in_flight,
+                cancel_after_release,
+            )
+        };
+        let (user, was_in_flight, is_in_flight, cancel_after_release) = transition_and_cancel;
+        self.apply_in_flight_transition((user, was_in_flight, is_in_flight));
+        cancel_after_release
+    }
+
+    pub(super) fn clear_order_in_flight(&mut self, user: Address, in_flight_size: U256) {
+        if in_flight_size > U256::ZERO {
+            self.decrement_in_flight_order(user);
+        }
+    }
+
+    pub(super) fn apply_in_flight_transition(
+        &mut self,
+        (user, was_in_flight, is_in_flight): (Address, bool, bool),
+    ) {
+        match (was_in_flight, is_in_flight) {
+            (false, true) => {
+                *self.in_flight_orders_by_user.entry(user).or_default() += 1;
+            }
+            (true, false) => self.decrement_in_flight_order(user),
+            _ => {}
+        }
+    }
+
+    fn decrement_in_flight_order(&mut self, user: Address) {
+        if let Some(count) = self.in_flight_orders_by_user.get_mut(&user) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.in_flight_orders_by_user.remove(&user);
+            }
+        }
     }
 
     fn cancel_unfilled_market_remainder(&mut self, order_id: &str) {

@@ -19,8 +19,32 @@ pub(crate) async fn submit_order(
     let ticket = state.admission.issue_ticket();
     let user = request.user;
 
+    refresh_admission_balance_if_needed(&state, user).await?;
+
     let _turn = ticket.wait_for_turn().await;
 
+    refresh_admission_balance_if_needed(&state, user).await?;
+
+    let admission = {
+        let mut engine = state.engine.lock().await;
+        engine.submit_order_and_claim_fills(request)?
+    };
+    for (index, fill) in admission.fills.iter().cloned().enumerate() {
+        if state.settlement_queue.send(fill).is_err() {
+            let mut engine = state.engine.lock().await;
+            for unsent in &admission.fills[index..] {
+                engine.abort_fill(unsent, false, false);
+            }
+            return Err(ApiError::Chain("settlement queue is closed".into()));
+        }
+    }
+    Ok(Json(admission.response))
+}
+
+async fn refresh_admission_balance_if_needed(
+    state: &AppState,
+    user: Address,
+) -> std::result::Result<(), ApiError> {
     let needs_refresh = {
         let engine = state.engine.lock().await;
         engine.balance_needs_admission_refresh(user)
@@ -47,20 +71,7 @@ pub(crate) async fn submit_order(
         }
     }
 
-    let admission = {
-        let mut engine = state.engine.lock().await;
-        engine.submit_order_and_claim_fills(request)?
-    };
-    for (index, fill) in admission.fills.iter().cloned().enumerate() {
-        if state.settlement_queue.send(fill).is_err() {
-            let mut engine = state.engine.lock().await;
-            for unsent in &admission.fills[index..] {
-                engine.abort_fill(unsent, false, false);
-            }
-            return Err(ApiError::Chain("settlement queue is closed".into()));
-        }
-    }
-    Ok(Json(admission.response))
+    Ok(())
 }
 
 pub(crate) async fn cancel_order(

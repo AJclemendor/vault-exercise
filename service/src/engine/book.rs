@@ -1,5 +1,5 @@
 use alloy::primitives::U256;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use crate::types::{BookLevel, BookSnapshot, OrderType, Side};
 
@@ -89,6 +89,14 @@ impl Engine {
             Side::Sell => &mut self.asks,
         };
         book.entry(price).or_default().push_back(order_id);
+    }
+
+    pub(crate) fn indexed_book_order_ids(&self) -> usize {
+        self.bids
+            .values()
+            .chain(self.asks.values())
+            .map(VecDeque::len)
+            .sum()
     }
 
     pub(super) fn available_limit_ids_at_price(&mut self, side: Side, price: U256) -> Vec<String> {

@@ -248,12 +248,8 @@ impl Engine {
             base: fill_size,
         };
 
-        if let Some(order) = self.orders.get_mut(&buy_id) {
-            order.in_flight_size += fill_size;
-        }
-        if let Some(order) = self.orders.get_mut(&sell_id) {
-            order.in_flight_size += fill_size;
-        }
+        self.add_order_in_flight(&buy_id, fill_size);
+        self.add_order_in_flight(&sell_id, fill_size);
 
         self.stats.fill_candidates += 1;
         Some(candidate)
@@ -383,9 +379,11 @@ impl Engine {
         .expect("stored order reservation should be bounded");
 
         let mut cancel_after_fill = false;
+        let mut terminal_filled = false;
         let release_after_fill: U256;
         let user;
         let first_successful_fill;
+        let in_flight_transition;
 
         {
             let Some(order) = self.orders.get_mut(order_id) else {
@@ -394,6 +392,7 @@ impl Engine {
             user = order.user;
             first_successful_fill = !order.matched_once;
             order.matched_once = true;
+            let was_in_flight = order.is_live() && order.in_flight_size > U256::ZERO;
             order.in_flight_size = sub_or_zero(order.in_flight_size, fill_size);
             order.filled_size += fill_size;
 
@@ -401,10 +400,13 @@ impl Engine {
                 order.filled_size = order.size;
                 order.status = OrderStatus::Filled;
                 order.cancel_requested = false;
+                terminal_filled = true;
             } else {
                 order.status = OrderStatus::PartiallyFilled;
                 cancel_after_fill = order.cancel_requested && order.in_flight_size.is_zero();
             }
+            let is_in_flight = order.is_live() && order.in_flight_size > U256::ZERO;
+            in_flight_transition = (user, was_in_flight, is_in_flight);
 
             let new_required = if order.is_live() {
                 reservation_for(order.side, order.price, order.total_remaining())
@@ -415,8 +417,14 @@ impl Engine {
             release_after_fill = sub_or_zero(old_required, new_required);
         }
 
+        self.apply_in_flight_transition(in_flight_transition);
+
         if release_after_fill > U256::ZERO {
             self.release_user_reservation(user, release_after_fill);
+        }
+
+        if terminal_filled {
+            self.untrack_live_order(user, order_id);
         }
 
         if cancel_after_fill {
@@ -441,11 +449,7 @@ impl Engine {
     }
 
     fn release_inflight(&mut self, order_id: &str, fill_size: U256) {
-        let mut cancel_after_release = false;
-        if let Some(order) = self.orders.get_mut(order_id) {
-            order.in_flight_size = sub_or_zero(order.in_flight_size, fill_size);
-            cancel_after_release = order.cancel_requested && order.in_flight_size.is_zero();
-        }
+        let cancel_after_release = self.subtract_order_in_flight(order_id, fill_size);
 
         if cancel_after_release {
             self.terminal_order(order_id, OrderStatus::Cancelled);

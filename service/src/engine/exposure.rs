@@ -16,18 +16,28 @@ impl Engine {
     }
 
     pub(super) fn user_has_in_flight_order(&self, user: Address) -> bool {
-        self.orders
-            .values()
-            .any(|order| order.user == user && order.is_live() && order.in_flight_size > U256::ZERO)
+        self.in_flight_orders_by_user
+            .get(&user)
+            .copied()
+            .unwrap_or(0)
+            > 0
     }
 
     pub(super) fn user_has_other_in_flight_order(&self, user: Address, order_id: &str) -> bool {
-        self.orders.values().any(|order| {
-            order.user == user
-                && order.id != order_id
-                && order.is_live()
-                && order.in_flight_size > U256::ZERO
-        })
+        match self
+            .in_flight_orders_by_user
+            .get(&user)
+            .copied()
+            .unwrap_or(0)
+        {
+            0 => false,
+            1 => self
+                .orders
+                .get(order_id)
+                .map(|order| order.in_flight_size.is_zero())
+                .unwrap_or(true),
+            _ => true,
+        }
     }
 
     pub(crate) fn stale_over_reserved_orders_for_user(
@@ -43,17 +53,19 @@ impl Engine {
         }
 
         let candidates: Vec<_> = self
-            .orders
-            .values()
-            .filter(|order| {
-                order.user == user
-                    && order.is_live()
-                    && order.in_flight_size.is_zero()
-                    && exclude_order_id
-                        .map(|excluded| order.id != excluded)
-                        .unwrap_or(true)
+            .live_order_ids_for_user(user)
+            .into_iter()
+            .filter(|order_id| {
+                exclude_order_id
+                    .map(|excluded| order_id != excluded)
+                    .unwrap_or(true)
             })
-            .map(|order| order.id.clone())
+            .filter(|order_id| {
+                self.orders
+                    .get(order_id)
+                    .map(|order| order.in_flight_size.is_zero())
+                    .unwrap_or(false)
+            })
             .collect();
 
         for order_id in candidates {
@@ -74,18 +86,19 @@ impl Engine {
     }
 
     fn hard_locked_for_user(&self, user: Address) -> U256 {
-        self.orders
-            .values()
-            .filter(|order| order.user == user && order.is_live())
+        self.live_order_ids_for_user(user)
+            .iter()
+            .filter_map(|order_id| self.orders.get(order_id))
             .fold(U256::ZERO, |total, order| {
                 total + hard_locked_for_order(order)
             })
     }
 
     fn hard_locked_for_user_excluding_order(&self, user: Address, order_id: &str) -> U256 {
-        self.orders
-            .values()
-            .filter(|order| order.user == user && order.id != order_id && order.is_live())
+        self.live_order_ids_for_user(user)
+            .iter()
+            .filter(|id| id.as_str() != order_id)
+            .filter_map(|id| self.orders.get(id))
             .fold(U256::ZERO, |total, order| {
                 total + hard_locked_for_order(order)
             })

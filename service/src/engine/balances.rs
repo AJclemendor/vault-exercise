@@ -126,6 +126,13 @@ impl Engine {
         let Some(balance) = self.balances.get_mut(&user) else {
             return;
         };
+        if balance
+            .last_refresh_block
+            .map(|last_block| block <= last_block)
+            .unwrap_or(false)
+        {
+            return;
+        }
         if !balance.dirty {
             balance.dirty = true;
             self.stats.cache_dirty_events += 1;

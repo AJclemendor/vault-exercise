@@ -11,7 +11,7 @@ use crate::stats::Stats;
 use crate::types::{ApiError, SubmitOrderRequest};
 use crate::types::{OrderResponse, OrderStatus, OrderType, OrderView, Side};
 use alloy::primitives::{Address, U256};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 const WAD: u128 = 1_000_000_000_000_000_000;
@@ -101,6 +101,8 @@ pub(crate) struct Engine {
     bids: BTreeMap<U256, VecDeque<String>>,
     asks: BTreeMap<U256, VecDeque<String>>,
     balances: HashMap<Address, BalanceState>,
+    live_order_ids_by_user: HashMap<Address, HashSet<String>>,
+    in_flight_orders_by_user: HashMap<Address, usize>,
     pending_fills: VecDeque<FillCandidate>,
     next_order_seq: u64,
     next_fill_seq: u64,
@@ -114,6 +116,8 @@ impl Engine {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             balances: HashMap::new(),
+            live_order_ids_by_user: HashMap::new(),
+            in_flight_orders_by_user: HashMap::new(),
             pending_fills: VecDeque::new(),
             next_order_seq: 1,
             next_fill_seq: 1,

@@ -124,7 +124,8 @@ pub(crate) async fn stats_log_loop(state: AppState) {
                 "  settlements_attempted {}/{} {} of candidates (fill_candidates={} precheck_passed={}/{} {} precheck_failed={}/{} {} tx_attempts={}/{} {} tx_submitted={}/{} {})\n",
                 "  settlements_reverted  {} {} of tx_attempts (receipt_status_reverted={})\n",
                 "  settlement_outcomes   success={} reverted={} send_fail={} receipt_fail={} precheck_fail={} aborted_before_tx={} unknown={} pending={} unattempted={}\n",
-                "  currently_open_orders {} live (open_status={} partial_status={}; lifetime_accepted_pct={})",
+                "  currently_open_orders {} live (open_status={} partial_status={}; lifetime_accepted_pct={})\n",
+                "  storage               stored_orders={} indexed_book_ids={} pending_engine_fills={}",
             ),
             ANSI_CYAN,
             ANSI_RESET,
@@ -185,6 +186,9 @@ pub(crate) async fn stats_log_loop(state: AppState) {
             paint(snapshot.currently_open_status_orders, ANSI_CYAN),
             paint(snapshot.currently_partially_filled_orders, ANSI_CYAN),
             stat_pct(snapshot.currently_open_orders_pct_of_accepted, ANSI_DIM),
+            paint(snapshot.stored_orders, ANSI_DIM),
+            paint(snapshot.indexed_book_order_ids, ANSI_DIM),
+            paint(snapshot.pending_engine_fills, ANSI_DIM),
         );
     }
 }

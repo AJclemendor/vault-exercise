@@ -34,7 +34,7 @@ pub(crate) struct ReceiptTuning {
 pub(crate) fn balance_tuning() -> BalanceTuning {
     BalanceTuning {
         admission_cache_max_age: duration_ms_env("ADMISSION_CACHE_MAX_AGE_MS", 3_000),
-        active_cache_max_age: duration_ms_env("ACTIVE_CACHE_MAX_AGE_MS", 900),
+        active_cache_max_age: duration_ms_env("ACTIVE_CACHE_MAX_AGE_MS", 2_500),
     }
 }
 

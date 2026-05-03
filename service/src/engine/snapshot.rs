@@ -15,20 +15,6 @@ impl Engine {
                 order.is_live() && order.order_type == OrderType::Market && !order.cancel_requested
             })
             .count();
-        let market_ioc_orders_accepted = self
-            .orders
-            .values()
-            .filter(|order| order.order_type == OrderType::Market)
-            .count() as u64;
-        let market_ioc_orders_cancelled_unfilled = self
-            .orders
-            .values()
-            .filter(|order| {
-                order.order_type == OrderType::Market
-                    && order.status == OrderStatus::Cancelled
-                    && order.filled_size.is_zero()
-            })
-            .count();
         let open_status_orders = self
             .orders
             .values()
@@ -53,6 +39,20 @@ impl Engine {
             .orders
             .values()
             .filter(|order| order.status == OrderStatus::Stale)
+            .count();
+        let market_ioc_orders_accepted = self
+            .orders
+            .values()
+            .filter(|order| order.order_type == OrderType::Market)
+            .count() as u64;
+        let market_ioc_orders_cancelled_unfilled = self
+            .orders
+            .values()
+            .filter(|order| {
+                order.order_type == OrderType::Market
+                    && order.status == OrderStatus::Cancelled
+                    && order.filled_size.is_zero()
+            })
             .count();
 
         let active_cache_ages: Vec<u128> = self
@@ -244,6 +244,9 @@ impl Engine {
                 stale_orders as u64,
                 self.stats.orders_accepted,
             ),
+            stored_orders: self.orders.len(),
+            pending_engine_fills: self.pending_fills.len(),
+            indexed_book_order_ids: self.indexed_book_order_ids(),
             successful_settlements: self.stats.successful_settlements,
             fills_settled: self.stats.successful_settlements,
             fills_successfully_settled: self.stats.successful_settlements,

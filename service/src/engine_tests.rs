@@ -93,6 +93,25 @@ fn older_refresh_does_not_clear_dirty_from_later_log_block() {
 }
 
 #[test]
+fn log_events_already_covered_by_refresh_do_not_mark_cache_dirty() {
+    let mut engine = Engine::new();
+    let user = address(1);
+
+    engine.apply_balance_refresh_at_block(user, wad(100), U256::ZERO, 12);
+
+    engine.mark_dirty_at_block(user, 10);
+    engine.mark_dirty_at_block(user, 12);
+
+    assert!(!engine.balance_view(user).stale);
+    assert_eq!(engine.stats.cache_dirty_events, 0);
+
+    engine.mark_dirty_at_block(user, 13);
+
+    assert!(engine.balance_view(user).stale);
+    assert_eq!(engine.stats.cache_dirty_events, 1);
+}
+
+#[test]
 fn direct_balance_view_does_not_mutate_cached_balance_state() {
     let mut engine = Engine::new();
     let user = address(1);
