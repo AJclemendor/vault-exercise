@@ -232,7 +232,7 @@ That overbooking is deliberate because it lets users express multiple resting in
 
 
 
-# Ghost Orders and Limitations
+# 5. Ghost Orders and Limitations
 
 A ghost order is an order that matches off-chain but cannot settle on-chain. In this service, that risk exists because matching is based on cached on-chain balances, while the actual settlement happens later through `Vault.matchOrders(...)`. A user may have enough token balance when an order is admitted or prechecked, then move funds or change allowance before the settlement transaction executes.
 
@@ -243,109 +243,80 @@ Pre-settlement refresh is still separate from transaction execution. More freque
 
 
 ### Order Design
-Resting limit orders are another deliberate tradeoff. They can overbook balance because each new limit only needs to be individually affordable against current real balance minus hard locks. This improves liquidity, but it can leave stale book liquidity after fills or balance changes. The service handles that by pruning or staling live orders after balance refreshes, fills, and failed settlement paths.
 
-The biggest production limitation is durability. Orders, reservations, fill candidates, in-flight settlements, submitted transaction hashes, receipt outcomes, balance-read block numbers, and dirty-user block numbers are all in memory. If the process restarts, queued and in-flight work cannot be reconstructed safely. In production, I would persist that state and make settlement workers resume only from durable records. Chain log events would mark users dirty at specific blocks, and a balance refresh would only clear dirty state if it was read at or after that dirty block.
+Resting limit orders intentionally allow overbooking: each new limit only needs to be individually affordable against current real balance minus hard locks. This lets users place multiple resting intents or ladder quotes with the same balance, improving book depth and matching. The tradeoff is that some visible liquidity can become stale after fills or balance changes, so the service prunes or stales live orders after refreshes, successful fills, and failed settlement paths.
 
-One additional improvement would be a final `eth_call` simulation of the exact `Vault.matchOrders(...)` transaction against the node’s pending state immediately before broadcast. That would catch many last-moment balance or allowance failures, let the service mark the affected fill dirty/stale, and convert some doomed transactions into precheck failures instead of actual settlement reverts.
+Another gap is durability. Orders, reservations, fill candidates, in-flight settlements, tx hashes, receipt outcomes, balance-read blocks, and dirty-user blocks are all in memory, so restart recovery is unsafe. In production, I would persist those records and resume settlement only from durable state.
+
+A further improvement would be a final `eth_call` simulation of the exact `Vault.matchOrders(...)` call against pending state before broadcast. That would catch many last-moment balance or allowance failures and turn doomed transactions into precheck failures instead of settlement reverts.
 
 
 
-# MAIN SECTION: 
+
+# 6. Admission
 ## Validate that users have sufficient fresh on-chain balance, net of hard locks, to cover each new order. A certain percentage of incoming orders are intentionally oversized and must be rejected.
 
-#### Note: the current service/contract model has no explicit maker/taker fees
-
-FLOW:
-POST `/orders` -> admission ticket -> wait for admission turn
-After the request reaches its turn, check the user's balance cache. If the cache is missing, dirty, or too old, refresh token and vault balances from chain.
-Admission rejects zero size/price, reservation overflow, stale balance cache after attempted refresh, or insufficient hard-available balance.
-Buy reserve is `ceil(price * size / WAD)`; sell reserve is `size`.
-Market orders are treated as hard risk: a live market order hard-locks its full remaining required balance.
-A new limit order still has to be individually affordable against the user's current real balance minus hard locks, so an obviously oversized limit order is rejected. But resting limit orders do not hard-lock the full remaining balance for future admission.
-
-How does your balance function when you place an order? 
-### MKT orders
-Market orders are admitted only if the full requested market-order reservation fits against current real balance minus hard locks. Once accepted, the market order hard-locks its remaining required balance. Resting limit orders can be overbooked, but after a market order is accepted the engine prunes over-reserved sibling orders by marking eligible live orders stale.
-
-Sell orders use `size` as the reservation amount; there is no separate close-position exception in the engine.
-### LMT orders
-Limit orders add their full notional/base requirement to `reserved` at placement, but resting limits are not hard-locked for later admission. That means a user with $100 can place multiple individually affordable limits, such as 10 x $90, and become over-reserved. Before settlement and after balance refreshes/fills, the service prunes or stales live orders when refreshed `reserved > real`; otherwise remaining orders that still fit can continue matching.
 
 
-# Order book + matching
+The service validates each new order against a fresh-enough on-chain token balance. The admission path is:
+
+`POST /orders` -> issue admission ticket -> wait for turn -> refresh balance if missing, dirty, or too old -> validate and reserve.
+
+Admission rejects zero size/price, reservation overflow, stale balance after attempted refresh, or insufficient hard-available balance.
+
+In the current service/contract model there are no maker or taker fees, so reservation math is:
+
+- Buy reserve: `ceil(price * size / WAD)`
+- Sell reserve: `size`
+
+Hard-available balance means real on-chain token balance minus hard locks. Market orders and in-flight fills are hard locks; resting limit orders are not fully hard-locked for future admission.
+
+### Market Orders
+
+Market orders must be fully affordable at admission. They cross immediately against available older resting limits. Any unmatched remainder is cancelled, while any matched in-flight amount stays hard-locked until settlement succeeds, fails, or is released.
+
+Because market orders create immediate settlement risk, accepting one can make the user's older resting limits over-reserved. In that case, the engine prunes eligible sibling orders by marking them stale.
+
+### Limit Orders
+
+Limit orders add their full notional or base requirement to `reserved`, but resting limits are not hard locks for later limit admission. This means a user with `$100` can place multiple individually affordable resting limits, such as ten `$90` orders, and become over-reserved.
+
+That overbooking is deliberate: it lets users ladder quotes and improves book depth. The tradeoff is that some visible liquidity can become stale after fills or balance changes, so the service prunes or stales live orders after refreshes, successful settlements, and failed settlement paths when refreshed `reserved > real`.
+
+If fees were added later, they would need to be included in the reservation formula. For example, a buyer-side fee would make buy reserve roughly:
+
+`ceil(price * size / WAD) + fee`
+
+and a seller-side fee would require either reserving extra token balance or settling fees from proceeds, depending on the fee model.
+
+
+# 7. Order Book + Matching
 
 ## Price-time priority. Limit orders rest and market orders cross immediately.
 
 Most of this logic lives in `service/src/engine`, especially `orders.rs`, `matching.rs`, and `book.rs`.
 
-The engine stores full order state in:
-
-- `orders: HashMap<String, Order>`
-
-Book indexes are limit-order queues keyed by price:
+The engine stores full order state in `orders: HashMap<String, Order>`. The public book is maintained through limit-order indexes keyed by price:
 
 - `bids: BTreeMap<U256, VecDeque<String>>`
 - `asks: BTreeMap<U256, VecDeque<String>>`
 
-We use `BTreeMap` because it keeps prices sorted. For bids we can walk prices from highest to lowest, and for asks we can walk prices from lowest to highest. Each price level stores order ids in a `VecDeque`, which gives FIFO ordering within the same price.
+`BTreeMap` keeps prices sorted, so bids can be walked from highest to lowest and asks from lowest to highest. Each price level stores order ids in a `VecDeque`, which preserves FIFO ordering within the same price level. Matching and snapshots lazily clean stale index entries, so the indexes may temporarily contain filled, cancelled, stale, or in-flight order ids, but only live and available limit orders are used.
 
-Earlier, if we only had:
+The current flow is: match synchronously, settle asynchronously. `POST /orders` refreshes admission balance if needed, waits for the admission ticket, submits the order through `submit_order_and_claim_fills(...)`, and immediately sends any generated `FillCandidate`s to the settlement queue. Settlement workers later refresh balances again, submit `Vault.matchOrders(...)`, confirm receipts, and apply success or abort/revert handling.
 
-```rust
-orders: HashMap<String, Order>
-balances: HashMap<Address, BalanceState>
-next_order_seq: u64
-next_fill_seq: u64
-stats: Stats
-```
+For market orders, `POST /orders` immediately walks the opposite book best-price-first and creates fill candidates against available older resting limits. Any unmatched remainder is cancelled before the response returns. Market orders never rest in the book and are hidden from `GET /orders` while their matched amount is waiting for settlement. If a market order matched, the engine keeps internal in-flight state so settlement success, revert, or abort can update reservations and fill state safely.
 
-then matching required scanning all buys against all sells:
+For limit orders, `POST /orders` immediately crosses any marketable quantity against the opposite book before indexing the new order. After that, the order is inserted into the limit-order index. Public book depth only counts live, available limit liquidity from users without an in-flight order, so in-flight matched quantity is not exposed as resting depth.
 
-```rust
-for buy in self.orders.values().filter(...) {
-    for sell in self.orders.values().filter(...) {
-        ...
-    }
-}
-```
-
-That is `O(B*S)`, worst case `O(N^2)`, and it does too much work under load.
-
-With the book indexes, inserts are `O(log P)` for price level lookup, where `P` is the number of price levels. Matching an incoming buy walks the lowest asks; matching an incoming sell walks the highest bids. In the common case this is much better because matching starts at the best price and FIFO queue instead of comparing every buy to every sell. The indexes may contain stale or in-flight ids until lazy cleanup, but snapshots and matching only use live, available limit orders.
-
-The current flow is now: match synchronously, settle asynchronously.
-
-For market orders, `POST /orders` immediately walks the opposite book best-price-first, creates fill candidates, and cancels any unfilled remainder before returning. Market orders never rest in the book and are not returned from `GET /orders` while waiting for settlement. If a market order matched, the service may keep an internal in-flight order record so settlement success/revert/abort can safely update reservations and fill state.
-
-For limit orders, `POST /orders` immediately crosses any marketable quantity against the opposite book. The order is indexed after matching, but only the remaining available quantity is visible/resting in book depth; in-flight matched quantity is hidden.
-
-The tradeoff is that settlement can still fail or be aborted after matching, because balances can change before the on-chain `Vault.matchOrders(...)` transaction lands, or because tx send, receipt, revert, or unknown-outcome handling fails. So the service still needs pre-settlement refresh, dirty marking, stale orders, and revert handling. But market-order behavior is now cleaner: matching/canceling happens immediately, while chain settlement remains async.
+The tradeoff is that settlement can still fail after off-chain matching because balances or allowances can change before `Vault.matchOrders(...)` executes, or because transaction send, receipt, revert, or unknown-outcome handling fails. That is why the service still needs pre-settlement refresh, dirty marking, stale orders, requeue handling, and revert/abort paths. Market-order behavior is still clean from the client perspective: matching and remainder cancellation happen immediately, while chain settlement remains asynchronous.
 
 
 
-### Settlement: Call Vault.matchOrders(buyer, seller, quoteAmount, baseAmount) using the operator key from config. Handle reverts and unknown receipts.
-
-This is where we go from off-chain matching to on-chain settlement.
-
-The matching engine creates a fill candidate, which later gets submitted as:
-
-vault.matchOrders(buyer, seller, quote, base).send().await
-
-Before sending this transaction, the service does a pre-settlement balance refresh. It re-checks both users' on-chain balances because balances can change between admission, matching, and settlement.
-
-If either side is still underfunded after refresh/pruning, the service does not submit the transaction and does not actually settle the orders.
-
-If both sides still have sufficient funds, the service sends the transaction and waits for the receipt. The receipt can resolve in three main ways:
-
-1. Success: the transaction landed and the service applies the fill.
-2. Confirmed revert: the transaction failed on-chain. The service does not rely on a specific revert reason.
-3. Uncertain: the service has a transaction hash, but cannot yet prove whether it succeeded or reverted.
-
-The uncertain case is important. The service keeps the fill pending and reservations locked while it rechecks the transaction receipt. If later checks prove success, it applies the fill. If they prove revert, it aborts/stales according to policy. If the receipt remains unresolved after the deferred timeout, it marks both users dirty, stales both orders, aborts the fill, and releases the reservations. If it unlocked the funds too early, another order could use the same balance while the original transaction later succeeds on-chain, which would break the service's accounting.
 
 
-### Balance reconciliation: On-chain balances change constantly underneath you. Your service needs a strategy for keeping its view fresh enough to make good admission decisions without polling every user every tick.
+# 9. Balance reconciliation: 
+## On-chain balances change constantly underneath you. Your service needs a strategy for keeping its view fresh enough to make good admission decisions without polling every user every tick.
 
 You obviously cannot hit the chain for every user on every tick. But caching balances is dangerous because stale balance data can make you admit orders that are no longer fundable. So the important thing is not just “use a cache”; it is “use a cache that has strong stale/dirty flags and only trust it when those flags say it is safe.”
 
