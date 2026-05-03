@@ -1,82 +1,56 @@
-# GPT was used for formatting and light copy editing; the substance is otherwise written by me
-- Small note as I am not very familiar with Rust: I made a point to keep non-test files under `service/src` below 500 lines.
-The dedicated test files are larger, and production modules only include small `#[cfg(test)]` hooks to point at those test files. This helped me review the implementation line by line and understand the generated output.
+# AJ - Vault Exercise submission
+
+# 1. Overview
+I used codex for formatting // spell check for this writeup but all initial versions of this were written by me before being cleaned up
+
+Small note as I am not very familiar with Rust: I made a point to keep non-test files under `service/src` below 500 lines. This added some complexity in a few places where I think longer files (Particularly in the engine part) would have been easier, if I had to do it over I would take this into consideration and be a little more lenient with the file size.
+
 Also, my eyesight is lowkey dying, so I tend to log some things with color and formatting because it makes runtime output easier for me to scan.
+# 2. Repo Run Stats Comparison (50k order run)
 
- ^ if you run the run.sh script you will see what I mean
-
-# Here are metrics for an 8 min run
-
-### First Stats Snapshot
-
-| Metric | Value |
-|---|---:|
-| Orders received | 597 |
-| Orders accepted | 475 / 597 (79.6%) |
-| Orders rejected | 122 / 597 (20.4%) |
-| Admission failures | 122 |
-| Bad request | 0 |
-| Insufficient balance | 122 |
-| Stale cache | 0 |
-| Refresh failures | 0 |
-| Orders matched | 230 / 475 (48.4%) |
-| Fill-side events | 372 |
-| Fill candidates | 199 |
-| Settlements attempted | 199 / 199 (100.0%) |
-| Precheck passed | 199 / 199 (100.0%) |
-| Precheck failed | 0 / 199 (0.0%) |
-| Tx attempts | 199 / 199 (100.0%) |
-| Tx submitted | 199 / 199 (100.0%) |
-| Settlements reverted | 0 |
-| Success | 186 |
-| Pending | 13 |
-| Currently open orders | 242 |
-| Open status | 214 |
-| Partial status | 28 |
-| Lifetime accepted pct | 50.9% |
-
-### Final Stats Snapshot
-
-| Metric | Value |
-|---|---:|
-| Orders received | 26,104 |
-| Orders accepted | 22,423 / 26,104 (85.9%) |
-| Orders rejected | 3,681 / 26,104 (14.1%) |
-| Admission failures | 3,681 |
-| Bad request | 0 |
-| Insufficient balance | 3,677 |
-| Stale cache | 4 |
-| Refresh failures | 0 |
-| Orders matched | 10,414 / 22,423 (46.4%) |
-| Fill-side events | 19,234 |
-| Fill candidates | 9,717 |
-| Settlements attempted | 9,698 / 9,717 (99.8%) |
-| Precheck passed | 9,695 / 9,698 (100.0%) |
-| Precheck failed | 3 / 9,698 (0.0%) |
-| Tx attempts | 9,695 / 9,695 (100.0%) |
-| Tx submitted | 9,695 / 9,695 (100.0%) |
-| Settlements reverted | 17 / 9,695 (0.2%) |
-| Success | 9,617 |
-| Pending | 61 |
-| Unattempted | 19 |
-| Currently open orders | 579 |
-| Open status | 569 |
-| Partial status | 10 |
-| Lifetime accepted pct | 2.6% |
+| Metric | First run | Last run |
+|---|---:|---:|
+| Orders received | 844 | 50,556 |
+| Orders accepted | 659 / 844 (78.1%) | 38,372 / 50,556 (75.9%) |
+| Orders rejected | 185 / 844 (21.9%) | 12,184 / 50,556 (24.1%) |
+| Admission failures | 185 | 12,184 |
+| Insufficient balance rejects | 185 | 12,181 |
+| Stale cache rejects | 0 | 3 |
+| Orders matched | 336 / 659 (51.0%) | 18,150 / 38,372 (47.3%) |
+| Fill side events | 590 | 35,142 |
+| Settlements attempted | 303 / 303 (100.0%) | 17,674 / 17,681 (100.0%) |
+| Precheck passed | 303 / 303 (100.0%) | 17,674 / 17,674 (100.0%) |
+| Settlements reverted | 0 (0.0%) | 18 (0.1%) |
+| Settlement success | 295 | 17,571 |
+| Settlement pending | 8 | 85 |
+| Settlement unattempted | 0 | 7 |
+| Currently open orders | 306 | 10,492 |
+| Open status | 281 | 10,212 |
+| Partial status | 25 | 280 |
+| Lifetime accepted pct open | 46.4% | 27.3% |
+| Stored orders | 659 | 38,372 |
+| Indexed book IDs | 325 | 10,945 |
+| Pending engine fills | 0 | 0 |
 
 
 
-The harness intentionally makes 25% of submitted orders oversized at `1.5x-3x` the user’s EOA balance. But “oversized” is based on raw size, while buy admission is based on notional. So a buy with `2x` balance in size at a `0.40` price only requires `0.8x` balance and can validly pass.
+## Notes about the adversarial harness
+When placing orders, the harness builds a normal order payload by reading the user’s EOA balance, converting it into whole tokens, randomly choosing side/type/price, and then choosing a size.
 
-The larger tradeoff is that resting limit orders are only required to be individually affordable against real balance minus hard locks. We do not hard-lock the full notional for every open limit order, so users can quote more liquidity than they could settle all at once. That makes the book deeper and more flexible, but it also means some resting orders may become stale after fills or balance changes.
+In 25% of cases, it sets the raw size to 1.5x-3x the user’s token balance. But it does not mark that order as special or “oversized”; it just submits the normal payload with side, order_type, price, and WAD size.
 
-Hard-locking every limit order would improve safety and book quality, but it would also reject more orders and make the market thinner. In a very liquid market, stricter hard locks may make sense. Here, we are deliberately trading some safety and occasional book quality for better available liquidity.
+The important mismatch is that buy admission does not check balance >= raw size. It checks:
+
+required_balance = price * size
+So a buy with 1.5x raw size can still pass if the price is low enough. For example, 1.5x size at 0.40 price only requires 0.60x balance.
+
+Meaning we should not expect exactly 25% of all orders to reject. Some of the 25% “oversized” bucket can still be accepted, especially buys at lower prices. So 
 
 
 
 
 
-# Repo Struct
+# 3. Architecture
 
 This summarizes the visible Rust service structure under `service/src`.
 
@@ -119,51 +93,161 @@ This summarizes the visible Rust service structure under `service/src`.
 | `tasks/settlement/concurrency.rs` | Concurrency support for settlement workers, including user lock striping and reorder invalidation tracking. |
 | `tasks/settlement/settlement_tests.rs` | Dedicated tests for settlement confirmation outcomes, uncertain receipts, unresolved fills, reverts, and send failures. |
 
+```mermaid
+flowchart LR
+    Client["HTTP client / harness"] --> Routes["routes.rs<br/>HTTP handlers"]
+    Routes --> Sequencer["sequencing.rs<br/>AdmissionSequencer"]
+    Sequencer --> Engine["engine/<br/>In-memory matching engine"]
+
+    Engine --> Orders["engine/orders.rs<br/>Admission, reservation, cancel"]
+    Engine --> Book["engine/book.rs<br/>Book indexes and snapshots"]
+    Engine --> Matching["engine/matching.rs<br/>Crossing, fill candidates"]
+    Engine --> Balances["engine/balances.rs<br/>Cached balances, dirty flags"]
+    Engine --> Exposure["engine/exposure.rs<br/>Hard-locked funds"]
+
+    Matching --> Settlement["tasks/settlement/<br/>Settlement workers"]
+    Settlement --> Chain["chain.rs<br/>RPC, balances, matchOrders"]
+    Chain --> Blockchain["Token + Vault<br/>contracts"]
+
+    Chain --> BalanceRefresh["tasks.rs<br/>Balance refresh / log polling"]
+    BalanceRefresh --> Balances
+    Routes --> Stats["stats.rs + engine/snapshot.rs<br/>/stats snapshots"]
+```
+
+### Fill lifecycle
+```mermaid
+sequenceDiagram
+    participant H as Harness / Client
+    participant R as routes.rs
+    participant S as AdmissionSequencer
+    participant E as Engine
+    participant Q as settlement_queue
+    participant T as Settlement loop
+    participant C as ChainClient
+    participant B as Blockchain
+
+    H->>R: POST /orders
+    R->>E: balance_needs_admission_refresh(user)
+    R->>C: read_user_balances(user), if needed
+    C-->>R: token + vault balances at block
+    R->>E: apply_balance_refresh_at_block()
+
+    R->>S: issue_ticket()
+    R->>S: ticket.wait_for_turn()
+
+    R->>E: balance_needs_admission_refresh(user)
+    R->>C: read_user_balances(user), if needed
+    C-->>R: refreshed balances
+    R->>E: apply_balance_refresh_at_block()
+
+    R->>E: submit_order_and_claim_fills(request)
+    E->>E: validate size, price, balance freshness
+    E->>E: reserve funds by side
+    E->>E: match_new_order()
+    E-->>R: OrderAdmission { response, fills }
+
+    loop each fill from admission
+        R->>Q: settlement_queue.send(fill)
+    end
+    R-->>H: OrderResponse
+
+    T->>Q: fill_rx.recv()
+    Q-->>T: FillCandidate
+
+    T->>E: fill_still_pending()
+    T->>C: read_user_balances(buyer/seller)
+    C-->>T: fresh balances
+    T->>E: apply_balance_refresh_at_block()
+    T->>E: prune_underfunded_fill_users()
+    T->>E: record_settlement_tx_attempt()
+
+    T->>C: submit_settlement_once()
+    C->>B: Vault.matchOrders(buyer, seller, quote, base)
+    B-->>C: receipt / revert / unknown
+    C-->>T: confirmation result
+
+    alt success
+        T->>C: refresh_after_success()
+        T->>E: apply_settlement_success()
+        T->>E: claim_fill_batch()
+        E-->>T: newly available fills
+        T->>Q: settlement_queue.send(requeued fills)
+    else revert or failed send
+        T->>E: abort_fill()
+        opt release/prune path can still match
+            T->>E: claim_fill_batch()
+            E-->>T: newly available fills
+            T->>Q: settlement_queue.send(requeued fills)
+        end
+    else uncertain receipt
+        T->>E: hold_unresolved_settlement()
+        T->>C: settlement_receipt_status(tx_hash)
+        alt later success
+            T->>E: apply_settlement_success()
+        else later revert
+            T->>E: abort_fill()
+        else timeout unresolved
+            T->>E: time_out_unresolved_settlement()
+        end
+    end
+```
+# 4. Design choices 
+
+Many of these design choices I believe have good arguments on both sides. I'll explain the reasoning behind my decisions and why, in this context, I believe the tradeoffs are worthwhile.
 
 
-# Verified against current app implementation
-# Logic design choices 
-
-- I honestly think I could make a strong argument for both sides of a lot of these choices so I will do my best to explain why I chose the ones I did and why I think for this the tradeoffs are worth it.
-
-
-# Harness edits
+## Harness edits
 
 The harness changes are limited to connection pooling and runtime control; they do not change the service HTTP API. The upstream harness created HTTP and RPC connections too aggressively under concurrency, which could cause runner crashes or timeouts from too many individual connections. To fix that, the harness now uses a shared `HarnessClients` struct with reusable `service: reqwest::Client` and `rpc: alloy::transports::http::reqwest::Client` clients, both configured with a 5 second timeout and a larger idle connection pool so setup, provider/reader creation, order loops, and chain loops can run higher concurrency more reliably.
 
 
 
 
-# General concurrency things
-The main concurrency change is that slow blockchain settlement work was moved out of the POST /orders path. The harness now reuses pooled HTTP/RPC clients, so it can generate high-concurrency load without wasting time on connection setup. On the service side, order admission and matching are still sequenced through admission tickets and the engine mutex, which keeps order IDs, fill IDs, book mutation, and price-time priority deterministic even when requests arrive concurrently.
+## General concurrency things
+The main concurrency change is that slow blockchain settlement work was moved out of the POST /orders path. The harness now reuses pooled HTTP/RPC clients, so it can generate high-concurrency load without wasting time on connection setup. On the service side, order admission and matching are still sequenced through admission tickets (Admission tickets are just a FIFO gate for POST /orders) and the engine mutex, which keeps order IDs, fill IDs, book mutation, and price-time priority deterministic even when requests arrive concurrently.
 
-Market orders now cross immediately and cancel any leftover size, while marketable limit orders also match immediately. The HTTP path creates fill candidates and pushes them to async settlement workers. Those workers handle balance refreshes, Vault.matchOrders(...), and receipts in the background, using bounds like semaphores, per-user locks, and apply gates so settlement can run concurrently without corrupting the book state chosen by the matching engine.
-
-Admission tickets are just a FIFO gate for POST /orders.
+Market orders now cross immediately and cancel any leftover size, while limit orders also match immediately. The HTTP path creates fill candidates and pushes them to async settlement workers. Those workers handle balance refreshes, Vault.matchOrders(...), and receipts in the background, using bounds like semaphores, per-user locks, and apply gates so settlement can run concurrently without corrupting the book state chosen by the matching engine.
 
 
 
+## Balance Accounting at Order Admission
+
+This section describes how the engine decides whether a new order can enter the book. It is separate from settlement durability: these checks protect the live in-memory engine while the process is running.
+
+For every order, the service uses a fresh-enough on-chain token balance, then checks the new order against the user's hard-available balance. Buy orders reserve `ceil(price * size / WAD)`, while sell orders reserve `size`. There is no separate close-position exception in the engine.
+
+Hard locks are intentionally narrower than total reservations. Market orders and in-flight fills count as hard locks. Resting limit orders increase `reserved`, but they are not fully hard-locked against future limit-order admission.
+
+### Market Orders
+
+Market orders are admitted only if the full requested market-order reservation fits against current real balance minus hard locks. Once accepted, they cross immediately against available older resting limits. Any unmatched remainder is cancelled, while any matched in-flight amount stays hard-locked until settlement succeeds, fails, or is released.
+
+Because market orders create immediate settlement risk, accepting one can make older resting limit orders no longer fit the user's real balance. When that happens, the engine prunes eligible over-reserved sibling orders by marking them stale.
+
+### Limit Orders
+
+Limit orders add their full notional or base requirement to `reserved` at placement, but resting limits are not hard-locked for later admission. This means a user with `$100` can place multiple individually affordable limits, such as ten `$90` orders, and become over-reserved.
+
+That overbooking is deliberate because it lets users express multiple resting intents with the same balance, supports laddered quotes across price levels, and makes the book deeper for matching and price discovery. The tradeoff is that not every visible resting order is guaranteed to remain fundable after other fills or balance changes. The service handles this by treating market orders and in-flight fills as hard locks, then pruning or staling live orders after balance refreshes, settlement success, and failed settlement paths when refreshed `reserved > real`.
 
 
-# Ghost Orders And Limitations
+
+# Ghost Orders and Limitations
+
+A ghost order is an order that matches off-chain but cannot settle on-chain. In this service, that risk exists because matching is based on cached on-chain balances, while the actual settlement happens later through `Vault.matchOrders(...)`. A user may have enough token balance when an order is admitted or prechecked, then move funds or change allowance before the settlement transaction executes.
+
+The service reduces this risk by refreshing stale balances before admission, sequencing admission through tickets, refreshing users with reserved balances in the background, marking users dirty from chain logs, and refreshing both buyer and seller again immediately before settlement. If the fill is already underfunded at that point, the service skips transaction submission. If settlement reverts or sending fails, it refreshes/marks dirty and either releases, prunes, or stales affected orders. If a transaction hash exists but the receipt is uncertain, the fill stays locked while the service rechecks; after a bounded timeout, both orders are staled and reservations are released.
+
+### Remaining gap
+Pre-settlement refresh is still separate from transaction execution. More frequent cache refreshes reduce stale admission and stale book liquidity, but they do not fully remove the final race between the last balance read and `Vault.matchOrders(...)` landing on-chain. Stronger production guarantees would likely require escrow, on-chain reservation, or another atomic commitment mechanism before matching.
 
 
-A ghost order is an order that matches off-chain but cannot settle on-chain. This happens because the service only has a snapshot of user balances. A user can have enough balance when an order is admitted, then transfer funds or withdraw from the vault before Vault.matchOrders(...) lands, causing the settlement transaction to revert.
+### Order Design
+Resting limit orders are another deliberate tradeoff. They can overbook balance because each new limit only needs to be individually affordable against current real balance minus hard locks. This improves liquidity, but it can leave stale book liquidity after fills or balance changes. The service handles that by pruning or staling live orders after balance refreshes, fills, and failed settlement paths.
 
-The service reduces this risk in several ways: it refreshes stale balances before admission, sequences admission before checking freshness, refreshes users with reserved balances in the background, marks users dirty from chain logs, refreshes buyer and seller balances again before settlement, skips transaction submission when a fill is already underfunded, and handles reverts by refreshing, pruning, releasing, or staling affected orders. If a transaction hash exists but the receipt outcome is unknown, the fill stays locked while the service rechecks; after a bounded timeout, both orders are staled and reservations are released.
+The biggest production limitation is durability. Orders, reservations, fill candidates, in-flight settlements, submitted transaction hashes, receipt outcomes, balance-read block numbers, and dirty-user block numbers are all in memory. If the process restarts, queued and in-flight work cannot be reconstructed safely. In production, I would persist that state and make settlement workers resume only from durable records. Chain log events would mark users dirty at specific blocks, and a balance refresh would only clear dirty state if it was read at or after that dirty block.
 
-The main unsolved weakness is that the pre-settlement refresh is not atomic with the on-chain transaction. A user can still move funds after the refresh but before settlement. That cannot be fully solved off-chain. A production system would likely need escrow or on-chain reservation before matching.
-
-Remaining tradeoffs: resting limit orders can overbook balance, which improves liquidity but can leave stale book liquidity after fills or balance changes. Balance freshness still depends on cache age, log polling, and dirty flags. Send failures without a transaction hash are handled conservatively but not durably tracked. The settlement queue and order state are in-memory, so process restarts lose queued and in-flight work. Receipt timeouts prevent funds from staying locked forever, but a late-successful transaction after timeout would require later reconciliation.
-
-In production, I would persist orders, reservations, fills, submitted tx hashes, receipt outcomes, balance-read block numbers, and dirty-user block numbers in a database, then make settlement workers resume only from that durable state. Before settlement, the worker would refresh balances and record the block; after submitting, it would store the tx hash/nonce before waiting for a receipt. Chain log events would mark users dirty at specific blocks, and a balance refresh would only clear dirty state if it was read at or after that block. After a restart, the service could safely reconstruct live orders, locked funds, pending settlements, and users that need refresh instead of relying on in-memory state.
-
-Other cool stuff I might try if I wanted to get another 0.1% and max this would be to add an explicit final `eth_call` simulation of the exact `Vault.matchOrders` transaction against the node’s "pending" state immediately before broadcast, after the service’s existing balance refresh and underfunded-fill pruning. That would catch many last-moment balance/allowance races locally, mark the affected users or fill dirty/stale, and skip sending a doomed transaction, turning some settlements_reverted or implicit send failures into measurable settlements_precheck_failed outcomes while keeping settlement_tx_attempts reserved for transactions the service actually broadcasts.
-
-
-
-Essentially if this crashes right now you are fucked, if it crashes in prod env you need to be able to fully replay // restore the entire state
-
+One additional improvement would be a final `eth_call` simulation of the exact `Vault.matchOrders(...)` transaction against the node’s pending state immediately before broadcast. That would catch many last-moment balance or allowance failures, let the service mark the affected fill dirty/stale, and convert some doomed transactions into precheck failures instead of actual settlement reverts.
 
 
 
