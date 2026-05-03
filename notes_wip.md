@@ -1,26 +1,29 @@
 # AJ - Vault Exercise submission
 
 # 1. Overview
-I used codex for formatting // spell check for this writeup but all initial versions of this were written by me before being cleaned up.
 
-Small note as I am not very familiar with Rust: I made a point to keep non-test files under `service/src` below 500 lines. This added some complexity in a few places where I think longer files (Particularly in the engine part) would have been easier, if I had to do it over I would take this into consideration and be a little more lenient with the file size.
+I used Codex for formatting // spell-check for this write-up but all initial versions of this were written by me before being cleaned up.
+
+Small note as I am not very familiar with Rust: I made a point to keep non-test files under `service/src` below 500 lines. This added some complexity in a few places where I think longer files (particularly in the engine part) would have been easier. If I had to do it over, I would take this into consideration and be a little more lenient with the file size.
 
 Also, my eyesight is lowkey dying, so I tend to log some things with color and formatting because it makes runtime output easier for me to scan.
+
 # 2. Repo Run Stats (50k order run)
 
-| Metric | Value |
-|---|---:|
-| Orders received | 50,556 |
-| Orders accepted | 38,372 / 50,556 (75.9%) |
-| Orders rejected (admission failures) | 12,184 / 50,556 (24.1%) |
-| Orders matched | 18,150 / 38,372 (47.3%) |
-| Settlements attempted | 17,674 / 17,681 (100.0%) |
-| Settlements reverted | 18 (0.1%) |
-| Currently open orders | 10,492 |
 
+| Metric                                                 | ~10k                              | ~20k                              | ~30k                               | ~40k                                | ~50k                                |
+| ------------------------------------------------------ | --------------------------------- | --------------------------------- | ---------------------------------- | ----------------------------------- | ----------------------------------- |
+| Orders received                                        | 10,561                            | 20,538                            | 30,469                             | 40,384                              | 50,375                              |
+| Orders accepted                                        | 8,401 / 10,561 (79.5%)            | 16,432 / 20,538 (80.0%)           | 23,916 / 30,469 (78.5%)            | 31,391 / 40,384 (77.7%)             | 39,622 / 50,375 (78.7%)             |
+| Orders rejected (admission failures)                   | 2,160 / 10,561 (20.5%)            | 4,106 / 20,538 (20.0%)            | 6,553 / 30,469 (21.5%)             | 8,993 / 40,384 (22.3%)              | 10,753 / 50,375 (21.3%)             |
+| Orders matched                                         | 4,692 / 8,401 (55.9%)             | 8,493 / 16,432 (51.7%)            | 11,906 / 23,916 (49.8%)            | 14,926 / 31,391 (47.5%)             | 17,908 / 39,622 (45.2%)             |
+| Settlements attempted (regardless of outcome)          | 4,471 / 4,471 candidates (100.0%) | 8,084 / 8,084 candidates (100.0%) | 11,381 / 11,401 candidates (99.8%) | 14,323 / 14,324 candidates (100.0%) | 17,064 / 17,064 candidates (100.0%) |
+| Settlements reverted (out of successful settlements) | 7 / 4,412 successful (0.2%)       | 12 / 8,012 successful (0.1%)      | 18 / 11,298 successful (0.2%)      | 25 / 14,194 successful (0.2%)       | 33 / 16,932 successful (0.2%)       |
+| Currently open orders                                  | 1,523                             | 2,104                             | 3,940                              | 5,430                               | 1,795                               |
 
 
 ## Notes about the adversarial harness
+
 When placing orders, the harness builds a normal order payload by reading the user’s EOA balance, converting it into whole tokens, randomly choosing side/type/price, and then choosing a size.
 
 In 25% of cases, it sets the raw size to 1.5x-3x the user’s token balance. But it does not mark that order as special or “oversized”; it just submits the normal payload with side, order_type, price, and WAD size.
@@ -32,56 +35,59 @@ So a buy with 1.5x raw size can still pass if the price is low enough. For examp
 
 Meaning we should not expect exactly 25% of all orders to reject. Some of the 25% “oversized” bucket can still be accepted, especially buys at lower prices.
 
-
-
-
-
 # 3. Architecture
 
 This summarizes the visible Rust service structure under `service/src`.
 
 ## Top-Level Entries
 
-| Path | Summary |
-| --- | --- |
-| `engine/` | Core in-memory matching engine. It owns orders, book indexes, balance reservations, fill candidates, matching rules, and settlement state application. |
-| `tasks/` | Submodules for background task implementations. Currently this holds the settlement worker logic used by `tasks.rs`. |
-| `chain.rs` | Blockchain/RPC adapter. It reads token and vault balances, submits `matchOrders` transactions, confirms receipts, checks receipt status, and scans logs for users whose balances need refresh. |
-| `chain_tests.rs` | Dedicated tests for chain log parsing, including indexed address topic decoding and dirty-user event aggregation. |
-| `engine_tests.rs` | Dedicated tests for engine behavior, including matching priority, balance reservation, stale order pruning, market order behavior, fill claiming, and stats accounting. |
-| `main.rs` | Application entrypoint. It loads config, builds `ChainClient`, initializes shared `AppState`, starts background loops, and wires the Axum HTTP routes. |
-| `routes.rs` | HTTP route handlers for order submission, cancellation, order listing, balance views, book snapshots, and stats snapshots. |
-| `runtime.rs` | Runtime tuning helpers. It reads environment variables for balance cache ages, background loop intervals, RPC timeouts, receipt retries, and receipt reconciliation windows. |
-| `sequencing_tests.rs` | Dedicated async tests for ordered gates and admission sequencing, including gap handling, idempotent completion, receipt apply ordering, and ticket-ordered order admission. |
-| `sequencing.rs` | Ordering utilities. It provides `OrderedGate` and `AdmissionSequencer` so concurrent work can be admitted or applied in deterministic sequence order. |
-| `stats.rs` | Counter and snapshot definitions for service metrics, plus percentage and ratio helpers used by the engine and `/stats` endpoint. |
-| `tasks.rs` | Background task entrypoints. It runs active balance refresh, chain log polling, periodic stats logging, and re-exports the settlement loop. |
-| `types.rs` | Shared API and domain types, including order side/type/status, request and response DTOs, book snapshots, balance views, and API error responses. |
+
+| Path                  | Summary                                                                                                                                                                                        |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `engine/`             | Core in-memory matching engine. It owns orders, book indexes, balance reservations, fill candidates, matching rules, and settlement state application.                                         |
+| `tasks/`              | Submodules for background task implementations. Currently this holds the settlement worker logic used by `tasks.rs`.                                                                           |
+| `chain.rs`            | Blockchain/RPC adapter. It reads token and vault balances, submits `matchOrders` transactions, confirms receipts, checks receipt status, and scans logs for users whose balances need refresh. |
+| `chain_tests.rs`      | Dedicated tests for chain log parsing, including indexed address topic decoding and dirty-user event aggregation.                                                                              |
+| `engine_tests.rs`     | Dedicated tests for engine behavior, including matching priority, balance reservation, stale order pruning, market order behavior, fill claiming, and stats accounting.                        |
+| `main.rs`             | Application entrypoint. It loads config, builds `ChainClient`, initializes shared `AppState`, starts background loops, and wires the Axum HTTP routes.                                         |
+| `routes.rs`           | HTTP route handlers for order submission, cancellation, order listing, balance views, book snapshots, and stats snapshots.                                                                     |
+| `runtime.rs`          | Runtime tuning helpers. It reads environment variables for balance cache ages, background loop intervals, RPC timeouts, receipt retries, and receipt reconciliation windows.                   |
+| `sequencing_tests.rs` | Dedicated async tests for ordered gates and admission sequencing, including gap handling, idempotent completion, receipt apply ordering, and ticket-ordered order admission.                   |
+| `sequencing.rs`       | Ordering utilities. It provides `OrderedGate` and `AdmissionSequencer` so concurrent work can be admitted or applied in deterministic sequence order.                                          |
+| `stats.rs`            | Counter and snapshot definitions for service metrics, plus percentage and ratio helpers used by the engine and `/stats` endpoint.                                                              |
+| `tasks.rs`            | Background task entrypoints. It runs active balance refresh, chain log polling, periodic stats logging, and re-exports the settlement loop.                                                    |
+| `types.rs`            | Shared API and domain types, including order side/type/status, request and response DTOs, book snapshots, balance views, and API error responses.                                              |
+
 
 ## `engine/` Submodules
 
-| Path | Summary |
-| --- | --- |
-| `engine/mod.rs` | Defines the main `Engine`, internal `Order` and `BalanceState` models, fill candidates, and module layout. |
-| `engine/orders.rs` | Handles order admission, validation, reservation, cancellation, visible open order listing, and terminal order state transitions. |
-| `engine/matching.rs` | Finds crossing orders, prepares fill candidates, manages in-flight fill state, applies successful settlements, and aborts failed fills. |
-| `engine/book.rs` | Maintains limit-order price indexes and builds public book snapshots with bids, asks, spread, and midpoint. |
+
+| Path                 | Summary                                                                                                                                         |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `engine/mod.rs`      | Defines the main `Engine`, internal `Order` and `BalanceState` models, fill candidates, and module layout.                                      |
+| `engine/orders.rs`   | Handles order admission, validation, reservation, cancellation, visible open order listing, and terminal order state transitions.               |
+| `engine/matching.rs` | Finds crossing orders, prepares fill candidates, manages in-flight fill state, applies successful settlements, and aborts failed fills.         |
+| `engine/book.rs`     | Maintains limit-order price indexes and builds public book snapshots with bids, asks, spread, and midpoint.                                     |
 | `engine/balances.rs` | Manages cached balances, dirty markers, refresh freshness, user balance views, and pruning when cached balances no longer support reservations. |
-| `engine/exposure.rs` | Computes hard-locked funds and checks whether users can safely keep live or in-flight orders after fills. |
-| `engine/snapshot.rs` | Builds `StatsSnapshot` values and records settlement/order metric counters. |
-| `engine/math.rs` | Small numeric helpers for U256 math, WAD formatting, and reservation calculations. |
+| `engine/exposure.rs` | Computes hard-locked funds and checks whether users can safely keep live or in-flight orders after fills.                                       |
+| `engine/snapshot.rs` | Builds `StatsSnapshot` values and records settlement/order metric counters.                                                                     |
+| `engine/math.rs`     | Small numeric helpers for U256 math, WAD formatting, and reservation calculations.                                                              |
+
 
 ## `tasks/` Submodules
 
-| Path | Summary |
-| --- | --- |
-| `tasks/settlement/mod.rs` | Settlement loop coordinator. It selects sequential, receipt-concurrent, or fully concurrent settlement modes from environment config. |
-| `tasks/settlement/outcome.rs` | Settlement lifecycle handling. It prechecks fills, submits transactions, confirms receipts, applies success, and reconciles uncertain outcomes. |
-| `tasks/settlement/concurrency.rs` | Concurrency support for settlement workers, including user lock striping and reorder invalidation tracking. |
-| `tasks/settlement/requeue.rs` | Helper for claiming and enqueueing newly available fills after settlement outcomes release more matchable orders. |
-| `tasks/settlement/settlement_tests.rs` | Dedicated tests for settlement confirmation outcomes, uncertain receipts, unresolved fills, reverts, and send failures. |
+
+| Path                                   | Summary                                                                                                                                         |
+| -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tasks/settlement/mod.rs`              | Settlement loop coordinator. It selects sequential, receipt-concurrent, or fully concurrent settlement modes from environment config.           |
+| `tasks/settlement/outcome.rs`          | Settlement lifecycle handling. It prechecks fills, submits transactions, confirms receipts, applies success, and reconciles uncertain outcomes. |
+| `tasks/settlement/concurrency.rs`      | Concurrency support for settlement workers, including user lock striping and reorder invalidation tracking.                                     |
+| `tasks/settlement/requeue.rs`          | Helper for claiming and enqueueing newly available fills after settlement outcomes release more matchable orders.                               |
+| `tasks/settlement/settlement_tests.rs` | Dedicated tests for settlement confirmation outcomes, uncertain receipts, unresolved fills, reverts, and send failures.                         |
+
 
 ### Service Architecture
+
 ```mermaid
 flowchart LR
     Client["HTTP client / harness"] --> Routes["routes.rs<br/>HTTP handlers"]
@@ -103,7 +109,10 @@ flowchart LR
     Routes --> Stats["stats.rs + engine/snapshot.rs<br/>/stats snapshots"]
 ```
 
+
+
 ### Order Admission and Settlement Lifecycle
+
 ```mermaid
 sequenceDiagram
     participant H as Harness / Client
@@ -190,22 +199,20 @@ sequenceDiagram
         end
     end
 ```
-# 4. Design choices 
 
+
+
+# 4. Design choices
 
 ## Harness edits
 
 The harness changes are limited to connection pooling and runtime control; they do not change the service HTTP API. The upstream harness created HTTP and RPC connections too aggressively under concurrency, which could cause runner crashes or timeouts from too many individual connections. To fix that, the harness now uses a shared `HarnessClients` struct with reusable `service: reqwest::Client` and `rpc: alloy::transports::http::reqwest::Client` clients, both configured with a 5 second timeout and a larger idle connection pool so setup, provider/reader creation, order loops, and chain loops can run higher concurrency more reliably.
 
-
-
-
 ## General concurrency things
+
 The main concurrency change is that slow blockchain settlement work was moved out of the POST /orders path. The harness now reuses pooled HTTP/RPC clients, so it can generate high-concurrency load without wasting time on connection setup. On the service side, order admission and matching are still sequenced through admission tickets (Admission tickets are just a FIFO gate for POST /orders) and the engine mutex, which keeps order IDs, fill IDs, book mutation, and price-time priority deterministic even when requests arrive concurrently.
 
 Market orders now cross immediately and cancel any leftover size, while limit orders also match immediately. The HTTP path creates fill candidates and pushes them to async settlement workers. Those workers handle balance refreshes, Vault.matchOrders(...), and receipts in the background, using bounds like semaphores, per-user locks, and apply gates so settlement can run concurrently without corrupting the book state chosen by the matching engine.
-
-
 
 ## Balance Accounting at Order Admission
 
@@ -231,8 +238,6 @@ That overbooking is deliberate because it lets users express multiple resting in
 
 I used a hybrid cache because the service needs fresh enough balances to reject bad orders, but cannot afford to read the chain for every user on every loop. The design choice is to trust cached balances only when they are recent and clean, then use stricter refreshes before settlement. Section 9 covers the full reconciliation flow: admission refreshes, active refresh, log-based dirty marking, and pre-settlement balance checks.
 
-
-
 # 5. Ghost Orders and Limitations
 
 A ghost order is an order that matches off-chain but cannot settle on-chain. In this service, that risk exists because matching is based on cached on-chain balances, while the actual settlement happens later through `Vault.matchOrders(...)`. A user may have enough token balance when an order is admitted or prechecked, then move funds or change allowance before the settlement transaction executes.
@@ -240,8 +245,8 @@ A ghost order is an order that matches off-chain but cannot settle on-chain. In 
 The service reduces this risk by refreshing stale balances before admission, sequencing admission through tickets, refreshing users with reserved balances in the background, marking users dirty from chain logs, and refreshing both buyer and seller again immediately before settlement. If the fill is already underfunded at that point, the service skips transaction submission. If settlement reverts or sending fails, it refreshes/marks dirty and either releases, prunes, or stales affected orders. If a transaction hash exists but the receipt is uncertain, the fill stays locked while the service rechecks; after a bounded timeout, both orders are staled and reservations are released.
 
 ### Remaining gap
-Pre-settlement refresh is still separate from transaction execution. More frequent cache refreshes reduce stale admission and stale book liquidity, but they do not fully remove the final race between the last balance read and `Vault.matchOrders(...)` landing on-chain. Stronger production guarantees would likely require escrow, on-chain reservation, or another atomic commitment mechanism before matching.
 
+Pre-settlement refresh is still separate from transaction execution. More frequent cache refreshes reduce stale admission and stale book liquidity, but they do not fully remove the final race between the last balance read and `Vault.matchOrders(...)` landing on-chain. Stronger production guarantees would likely require escrow, on-chain reservation, or another atomic commitment mechanism before matching.
 
 ### Order Design
 
@@ -251,12 +256,7 @@ Another gap is durability. Orders, reservations, fill candidates, in-flight sett
 
 A further improvement would be a final `eth_call` simulation of the exact `Vault.matchOrders(...)` call against pending state before broadcast. That would catch many last-moment balance or allowance failures and turn doomed transactions into precheck failures instead of settlement reverts.
 
-
-
-
 # 6. Admission
-
-
 
 The service validates each new order against a fresh-enough on-chain token balance. The admission path is:
 
@@ -275,9 +275,7 @@ If fees were added later, they would need to be included in the reservation form
 
 and a seller-side fee would require either reserving extra token balance or settling fees from proceeds, depending on the fee model.
 
-
 # 7. Order Book + Matching
-
 
 Most of this logic lives in `service/src/engine`, especially `orders.rs`, `matching.rs`, and `book.rs`.
 
@@ -295,7 +293,6 @@ For market orders, `POST /orders` immediately walks the opposite book best-price
 For limit orders, `POST /orders` immediately crosses any marketable quantity against the opposite book before indexing the new order. After that, the order is inserted into the limit-order index. Public book depth only counts live, available limit liquidity from users without an in-flight order, so in-flight matched quantity is not exposed as resting depth.
 
 The tradeoff is that settlement can still fail after off-chain matching because balances or allowances can change before `Vault.matchOrders(...)` executes, or because transaction send, receipt, revert, or unknown-outcome handling fails. That is why the service still needs pre-settlement refresh, dirty marking, stale orders, requeue handling, and revert/abort paths. Market-order behavior is still clean from the client perspective: matching and remainder cancellation happen immediately, while chain settlement remains asynchronous.
-
 
 # 8. Settlement
 
@@ -318,7 +315,6 @@ After broadcast, settlement has three main outcomes:
 The uncertain path is intentionally conservative. If later receipt checks prove success, the service applies the fill. If they prove revert, it handles the fill as a known failure. If the receipt remains unresolved after the deferred timeout, the service records an unknown outcome, marks both users dirty, stales both orders, aborts the fill, and releases reservations.
 
 The reason for holding locks during uncertainty is accounting safety. Once a transaction hash exists, the service cannot assume failure just because receipt lookup is temporarily unavailable. Releasing funds too early could let another fill reuse the same balance while the original transaction later succeeds on-chain.
-
 
 # 9. Balance Reconciliation
 
