@@ -2,6 +2,7 @@ mod settlement;
 
 use crate::AppState;
 use crate::runtime::task_tuning;
+use crate::stats::pct;
 
 pub(crate) use settlement::settlement_loop;
 
@@ -111,6 +112,10 @@ pub(crate) async fn stats_log_loop(state: AppState) {
         let settlement_pending_attempted = snapshot
             .settlement_pending_outcomes
             .saturating_sub(settlement_unattempted);
+        let settlements_reverted_pct_of_successful = pct(
+            snapshot.settlements_reverted,
+            snapshot.successful_settlements,
+        );
         let settlement_pending_color = nonzero_color(settlement_pending_attempted, ANSI_YELLOW);
         let settlement_unattempted_color = nonzero_color(settlement_unattempted, ANSI_YELLOW);
 
@@ -122,7 +127,8 @@ pub(crate) async fn stats_log_loop(state: AppState) {
                 "  orders_rejected       {}/{} {} {} (admission_failures={} bad_req={} insuff={} stale_cache={} refresh_fail={})\n",
                 "  orders_matched        {}/{} {} {} (unique orders with >=1 successful fill; fill_side_events={})\n",
                 "  settlements_attempted {}/{} {} of candidates (fill_candidates={} precheck_passed={}/{} {} precheck_failed={}/{} {} tx_attempts={}/{} {} tx_submitted={}/{} {})\n",
-                "  settlements_reverted  {} {} of tx_attempts (receipt_status_reverted={})\n",
+                "  settlement_success    {}/{} {} of attempted\n",
+                "  settlements_reverted  {}/{} {} of successful (receipt_status_reverted={})\n",
                 "  settlement_outcomes   success={} reverted={} send_fail={} receipt_fail={} precheck_fail={} aborted_before_tx={} unknown={} pending={} unattempted={}\n",
                 "  currently_open_orders {} live (open_status={} partial_status={}; lifetime_accepted_pct={})\n",
                 "  storage               stored_orders={} indexed_book_ids={} pending_engine_fills={}",
@@ -170,8 +176,12 @@ pub(crate) async fn stats_log_loop(state: AppState) {
             paint(snapshot.settlement_tx_submitted, ANSI_GREEN),
             paint(snapshot.settlement_tx_attempts, ANSI_DIM),
             stat_pct(snapshot.settlement_tx_submitted_pct_of_attempts, ANSI_GREEN),
+            stat_count(snapshot.successful_settlements, ANSI_GREEN),
+            paint(snapshot.settlements_attempted, ANSI_DIM),
+            stat_pct(snapshot.successful_settlements_pct, ANSI_GREEN),
             stat_count(snapshot.settlements_reverted, revert_color),
-            stat_pct(snapshot.settlements_reverted_pct, revert_color),
+            paint(snapshot.successful_settlements, ANSI_GREEN),
+            stat_pct(settlements_reverted_pct_of_successful, revert_color),
             paint(snapshot.settlement_receipt_status_reverted, revert_color),
             paint(snapshot.successful_settlements, ANSI_GREEN),
             paint(snapshot.settlements_reverted, revert_color),
