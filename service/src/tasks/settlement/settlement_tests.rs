@@ -176,6 +176,49 @@ fn send_failures_abort_fill_state_without_tx_hash() {
 }
 
 #[test]
+fn funded_revert_release_policy_stales_both_orders() {
+    let mut engine = Engine::new();
+    let buyer = address(1);
+    let seller = address(2);
+    engine.apply_balance_refresh(buyer, wad(20), U256::ZERO);
+    engine.apply_balance_refresh(seller, wad(10), U256::ZERO);
+    submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+    submit(
+        &mut engine,
+        seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+    let fill = engine.next_fill_candidate().expect("orders should cross");
+
+    abort_release_or_prune_reverted_fill(&mut engine, &fill);
+
+    assert!(!engine.fill_still_pending(&fill));
+    assert!(engine.open_orders(Some(buyer)).is_empty());
+    assert!(engine.open_orders(Some(seller)).is_empty());
+    assert_eq!(engine.stats_snapshot().orders_marked_stale, 2);
+}
+
+#[test]
+fn reorder_generation_after_prior_event_does_not_invalidate_fresh_fill() {
+    let reorder_state = super::super::concurrency::PreSubmitReorderState::new();
+
+    reorder_state.record_event(1);
+    let generation_after_event = reorder_state.generation();
+
+    assert!(!reorder_state.invalidates(generation_after_event, 2));
+}
+
+#[test]
 fn settlement_mode_config_reads_mode_source() {
     let concurrent =
         super::super::SettlementConfig::from_sources(Some("concurrent"), |_, default| default);
@@ -186,6 +229,26 @@ fn settlement_mode_config_reads_mode_source() {
         super::super::SettlementConfig::from_sources(Some("sequential"), |_, default| default);
     assert_eq!(sequential.mode, super::super::SettlementMode::Sequential);
     assert_eq!(sequential.concurrency, 1);
+}
+
+#[tokio::test]
+async fn user_settlement_lock_blocks_sibling_receipt_work() {
+    let locks = Arc::new(super::super::concurrency::UserSettlementLocks::new(256));
+    let buyer = address(1);
+    let first_seller = address(2);
+    let second_seller = address(3);
+    let first_guard = locks.lock_pair(buyer, first_seller).await;
+    let second_locks = locks.clone();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    tokio::spawn(async move {
+        let _guard = second_locks.lock_pair(buyer, second_seller).await;
+        tx.send(()).expect("receiver should be alive");
+    });
+
+    assert!(timeout(Duration::from_millis(25), rx.recv()).await.is_err());
+    drop(first_guard);
+    assert_eq!(rx.recv().await, Some(()));
 }
 
 #[tokio::test]
@@ -230,6 +293,103 @@ async fn released_crossed_orders_are_requeued_for_settlement() {
 
     assert_eq!(requeued.buy_id, buy_id);
     assert_eq!(requeued.sell_id, sell_id);
+}
+
+#[tokio::test]
+async fn requeue_send_failure_records_aborted_terminal_outcome() {
+    let buyer = address(1);
+    let seller = address(2);
+    let mut engine = Engine::new();
+    engine.apply_balance_refresh(buyer, wad(20), U256::ZERO);
+    engine.apply_balance_refresh(seller, wad(10), U256::ZERO);
+    submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+    submit(
+        &mut engine,
+        seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+
+    let (settlement_queue, settlement_rx) = mpsc::unbounded_channel();
+    drop(settlement_rx);
+    let state = AppState {
+        engine: Arc::new(Mutex::new(engine)),
+        chain: test_chain_client(),
+        admission: Arc::new(AdmissionSequencer::new()),
+        settlement_queue,
+    };
+
+    super::super::requeue::claim_and_enqueue_available_fills(&state).await;
+
+    let engine = state.engine.lock().await;
+    let snapshot = engine.stats_snapshot();
+    assert_eq!(snapshot.fill_candidates, 1);
+    assert_eq!(snapshot.settlements_aborted_before_tx, 1);
+    assert_eq!(snapshot.settlement_pending_outcomes, 0);
+}
+
+#[tokio::test]
+async fn one_sided_revert_prune_requeues_released_counterparty() {
+    let buyer = address(1);
+    let first_seller = address(2);
+    let second_seller = address(3);
+    let mut engine = Engine::new();
+    engine.apply_balance_refresh(buyer, wad(20), U256::ZERO);
+    engine.apply_balance_refresh(first_seller, wad(10), U256::ZERO);
+    engine.apply_balance_refresh(second_seller, wad(10), U256::ZERO);
+    let buy_id = submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+    submit(
+        &mut engine,
+        first_seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+    let second_sell_id = submit(
+        &mut engine,
+        second_seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+    let reverted = engine.next_fill_candidate().expect("orders should cross");
+    engine.apply_balance_refresh(first_seller, U256::ZERO, U256::ZERO);
+    abort_release_or_prune_reverted_fill(&mut engine, &reverted);
+
+    let (settlement_queue, mut settlement_rx) = mpsc::unbounded_channel();
+    let state = AppState {
+        engine: Arc::new(Mutex::new(engine)),
+        chain: test_chain_client(),
+        admission: Arc::new(AdmissionSequencer::new()),
+        settlement_queue,
+    };
+
+    super::super::requeue::claim_and_enqueue_available_fills(&state).await;
+    let requeued = settlement_rx
+        .recv()
+        .await
+        .expect("released buyer should requeue against second seller");
+
+    assert_eq!(requeued.buy_id, buy_id);
+    assert_eq!(requeued.sell_id, second_sell_id);
 }
 
 #[tokio::test]

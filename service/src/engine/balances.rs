@@ -135,7 +135,7 @@ impl Engine {
         };
         if balance
             .last_refresh_block
-            .map(|last_block| block <= last_block)
+            .map(|last_block| block < last_block)
             .unwrap_or(false)
         {
             return;

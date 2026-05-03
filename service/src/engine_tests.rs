@@ -100,7 +100,6 @@ fn log_events_already_covered_by_refresh_do_not_mark_cache_dirty() {
     engine.apply_balance_refresh_at_block(user, wad(100), U256::ZERO, 12);
 
     engine.mark_dirty_at_block(user, 10);
-    engine.mark_dirty_at_block(user, 12);
 
     assert!(!engine.balance_view(user).stale);
     assert_eq!(engine.stats.cache_dirty_events, 0);
@@ -109,6 +108,24 @@ fn log_events_already_covered_by_refresh_do_not_mark_cache_dirty() {
 
     assert!(engine.balance_view(user).stale);
     assert_eq!(engine.stats.cache_dirty_events, 1);
+}
+
+#[test]
+fn same_block_log_event_marks_cache_dirty_after_refresh() {
+    let mut engine = Engine::new();
+    let user = address(1);
+
+    engine.apply_balance_refresh_at_block(user, wad(100), U256::ZERO, 12);
+    engine.mark_dirty_at_block(user, 12);
+
+    assert!(engine.balance_view(user).stale);
+    assert_eq!(engine.stats.cache_dirty_events, 1);
+
+    engine.apply_balance_refresh_at_block(user, wad(90), U256::ZERO, 12);
+
+    let view = engine.balance_view(user);
+    assert!(!view.stale);
+    assert_eq!(view.real, wad(90));
 }
 
 #[test]
@@ -1910,6 +1927,81 @@ fn sell_reservation_accounting_overflow_is_rejected() {
 }
 
 #[test]
+fn buy_reservation_uses_aggregate_notional_for_wad_lots() {
+    let mut engine = Engine::new();
+    let buyer = address(1);
+    let price = tenth_wad(5);
+    let expected_quote = wad(3) / U256::from(2u8);
+    engine.apply_balance_refresh(buyer, expected_quote, U256::ZERO);
+    for seller_byte in 2..=4 {
+        let seller = address(seller_byte);
+        engine.apply_balance_refresh(seller, wad(1), U256::ZERO);
+        submit(
+            &mut engine,
+            seller,
+            Side::Sell,
+            OrderType::Limit,
+            price,
+            wad(1),
+        );
+    }
+
+    let admission = engine
+        .submit_order_and_claim_fills(SubmitOrderRequest {
+            user: buyer,
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            price,
+            size: wad(3),
+        })
+        .expect("buy should be accepted when aggregate notional is funded");
+    let quote_sum = admission
+        .fills
+        .iter()
+        .fold(U256::ZERO, |sum, fill| sum + fill.quote);
+
+    assert_eq!(admission.fills.len(), 3);
+    assert_eq!(quote_sum, expected_quote);
+    assert_eq!(engine.balance_view(buyer).reserved, quote_sum);
+}
+
+#[test]
+fn market_buy_remainder_keeps_retained_quote_reserved() {
+    let mut engine = Engine::new();
+    let buyer = address(1);
+    let seller = address(2);
+    let price = wad(3) / U256::from(2u8);
+    let expected_quote = wad(3) / U256::from(2u8);
+    engine.apply_balance_refresh(buyer, wad(3), U256::ZERO);
+    engine.apply_balance_refresh(seller, wad(1), U256::ZERO);
+    submit(
+        &mut engine,
+        seller,
+        Side::Sell,
+        OrderType::Limit,
+        price,
+        wad(1),
+    );
+
+    let admission = engine
+        .submit_order_and_claim_fills(SubmitOrderRequest {
+            user: buyer,
+            side: Side::Buy,
+            order_type: OrderType::Market,
+            price,
+            size: wad(2),
+        })
+        .expect("market buy should be accepted");
+
+    assert_eq!(admission.fills.len(), 1);
+    assert_eq!(admission.fills[0].quote, expected_quote);
+    assert_eq!(
+        engine.balance_view(buyer).reserved,
+        admission.fills[0].quote
+    );
+}
+
+#[test]
 fn book_snapshot_midpoint_handles_large_prices() {
     let mut engine = Engine::new();
     let mut buy = order(Side::Buy, 1, 1);
@@ -1926,6 +2018,38 @@ fn book_snapshot_midpoint_handles_large_prices() {
     assert_eq!(snapshot.best_ask_raw, Some(U256::MAX));
     assert_eq!(snapshot.mid_raw, Some(U256::MAX - U256::from(1u8)));
     assert_eq!(snapshot.spread_raw, Some(U256::from(1u8)));
+    assert!(!snapshot.crossed);
+}
+
+#[test]
+fn book_snapshot_marks_self_blocked_crossed_book() {
+    let mut engine = Engine::new();
+    let user = address(1);
+    engine.apply_balance_refresh(user, wad(20), U256::ZERO);
+    submit(
+        &mut engine,
+        user,
+        Side::Buy,
+        OrderType::Limit,
+        wad(10),
+        wad(1),
+    );
+    submit(
+        &mut engine,
+        user,
+        Side::Sell,
+        OrderType::Limit,
+        wad(8),
+        wad(1),
+    );
+
+    let snapshot = engine.book_snapshot(1);
+
+    assert_eq!(snapshot.best_bid_raw, Some(wad(10)));
+    assert_eq!(snapshot.best_ask_raw, Some(wad(8)));
+    assert!(snapshot.crossed);
+    assert_eq!(snapshot.spread_raw, None);
+    assert_eq!(snapshot.spread, None);
 }
 
 #[test]

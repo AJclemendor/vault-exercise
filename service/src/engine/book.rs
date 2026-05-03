@@ -3,7 +3,7 @@ use std::collections::{HashMap, VecDeque};
 
 use crate::types::{BookLevel, BookSnapshot, OrderType, Side};
 
-use super::math::{format_wad, sub_or_zero};
+use super::math::format_wad;
 use super::{Engine, Order};
 
 impl Engine {
@@ -14,8 +14,12 @@ impl Engine {
 
         let best_bid_raw = bid_levels.first().map(|level| level.price_raw);
         let best_ask_raw = ask_levels.first().map(|level| level.price_raw);
+        let crossed = matches!(
+            (best_bid_raw, best_ask_raw),
+            (Some(bid), Some(ask)) if bid > ask
+        );
         let spread_raw = match (best_bid_raw, best_ask_raw) {
-            (Some(bid), Some(ask)) => Some(sub_or_zero(ask, bid)),
+            (Some(bid), Some(ask)) if ask >= bid => Some(ask - bid),
             _ => None,
         };
         let mid_raw = match (best_bid_raw, best_ask_raw) {
@@ -31,6 +35,7 @@ impl Engine {
             best_ask_raw,
             spread: spread_raw.map(|spread| format_wad(spread, 4)),
             spread_raw,
+            crossed,
             mid: mid_raw.map(|mid| format_wad(mid, 4)),
             mid_raw,
             bids: bid_levels,

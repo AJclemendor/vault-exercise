@@ -98,6 +98,7 @@ pub(crate) struct BookSnapshot {
     pub(crate) best_ask_raw: Option<U256>,
     pub(crate) spread: Option<String>,
     pub(crate) spread_raw: Option<U256>,
+    pub(crate) crossed: bool,
     pub(crate) mid: Option<String>,
     pub(crate) mid_raw: Option<U256>,
 }

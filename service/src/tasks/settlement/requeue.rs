@@ -17,6 +17,7 @@ pub(super) async fn claim_and_enqueue_available_fills(state: &AppState) {
             let mut engine = state.engine.lock().await;
             for unsent in &fills[index..] {
                 engine.abort_fill(unsent, false, false);
+                engine.record_settlement_aborted_before_tx();
             }
             return;
         }

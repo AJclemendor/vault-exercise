@@ -63,6 +63,23 @@ async fn ordered_gate_completion_is_idempotent() {
 }
 
 #[tokio::test]
+async fn ordered_gate_does_not_grant_duplicate_live_turns() {
+    let gate = OrderedGate::new(1);
+    let first_turn = gate.wait_for_turn(1).await;
+    let duplicate_gate = gate.clone();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    tokio::spawn(async move {
+        let _turn = duplicate_gate.wait_for_turn(1).await;
+        tx.send(()).expect("receiver should be alive");
+    });
+
+    assert!(timeout(Duration::from_millis(25), rx.recv()).await.is_err());
+    drop(first_turn);
+    assert_eq!(rx.recv().await, Some(()));
+}
+
+#[tokio::test]
 async fn later_receipt_ready_waits_for_earlier_apply() {
     let gate = OrderedGate::new(1);
     let (tx, mut rx) = mpsc::unbounded_channel();

@@ -1,4 +1,5 @@
 use crate::AppState;
+use crate::engine::Engine;
 use crate::stats::StatsSnapshot;
 use crate::types::{
     ApiError, BalanceView, BookQuery, BookSnapshot, OrderResponse, OrderView, OrdersQuery,
@@ -16,6 +17,12 @@ pub(crate) async fn submit_order(
     request: std::result::Result<Json<SubmitOrderRequest>, JsonRejection>,
 ) -> std::result::Result<Json<OrderResponse>, ApiError> {
     let Json(request) = request.map_err(json_error)?;
+    if let Err(err) = Engine::validate_order_request(&request) {
+        let mut engine = state.engine.lock().await;
+        engine.record_order_shape_rejection();
+        return Err(err);
+    }
+
     let ticket = state.admission.issue_ticket();
     let user = request.user;
 
@@ -30,11 +37,14 @@ pub(crate) async fn submit_order(
         engine.submit_order_and_claim_fills(request)?
     };
     let order_id = admission.response.order_id.clone();
-    for fill in admission.fills.iter().cloned() {
+    for (index, fill) in admission.fills.iter().cloned().enumerate() {
         if state.settlement_queue.send(fill).is_err() {
             let mut engine = state.engine.lock().await;
-            engine.abort_admission_after_queue_failure(&order_id, &admission.fills);
-            return Err(ApiError::Chain("settlement queue is closed".into()));
+            engine.abort_admission_after_queue_failure(&order_id, &admission.fills, index);
+            if index == 0 {
+                return Err(ApiError::Chain("settlement queue is closed".into()));
+            }
+            return Ok(Json(admission.response));
         }
     }
     Ok(Json(admission.response))

@@ -1,4 +1,5 @@
 mod concurrency;
+mod failure;
 mod outcome;
 mod requeue;
 
@@ -214,7 +215,6 @@ async fn concurrent_settlement_loop(
     let reorder_state = Arc::new(PreSubmitReorderState::new());
 
     loop {
-        let claim_generation = reorder_state.generation();
         let first_worker_permit = worker_permits
             .clone()
             .acquire_owned()
@@ -235,10 +235,10 @@ async fn concurrent_settlement_loop(
             break;
         };
         let mut fills = Vec::with_capacity(capacity);
-        fills.push(first_fill);
+        fills.push((first_fill, reorder_state.generation()));
         while fills.len() < capacity {
             match fill_rx.try_recv() {
-                Ok(fill) => fills.push(fill),
+                Ok(fill) => fills.push((fill, reorder_state.generation())),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => break,
             }
@@ -265,7 +265,7 @@ async fn concurrent_settlement_loop(
             );
         }
 
-        for ((fill, worker_permit), inflight_permit) in fills
+        for (((fill, claim_generation), worker_permit), inflight_permit) in fills
             .into_iter()
             .zip(worker_permits_for_batch)
             .zip(inflight_permits_for_batch)
@@ -344,22 +344,22 @@ fn spawn_concurrent_settlement_worker(args: SettlementWorkerArgs) {
             return;
         }
 
-        let submit_outcome = submit_settlement_once(&args.state, &args.fill).await;
-        drop(tx_turn);
-
-        match submit_outcome {
+        match submit_settlement_once(&args.state, &args.fill).await {
             SubmitOutcome::SendFailed => {
+                drop(tx_turn);
                 args.reorder_state.record_event(args.fill.seq);
                 args.apply_gate.complete(args.fill.seq);
                 claim_and_enqueue_available_fills(&args.state).await;
             }
             SubmitOutcome::Submitted(pending) => {
-                let _receipt_permit = args
+                let receipt_permit = args
                     .receipt_permits
                     .clone()
                     .acquire_owned()
                     .await
                     .expect("settlement receipt semaphore should not close");
+                drop(tx_turn);
+                let _receipt_permit = receipt_permit;
                 confirm_and_apply_settlement(
                     args.state,
                     args.fill,

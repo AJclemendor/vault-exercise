@@ -18,6 +18,7 @@ struct OrderedGateInner {
 #[derive(Debug)]
 struct OrderedGateState {
     next_seq: u64,
+    in_progress: Option<u64>,
     completed: BTreeSet<u64>,
 }
 
@@ -27,6 +28,7 @@ impl OrderedGate {
             inner: Arc::new(OrderedGateInner {
                 state: Mutex::new(OrderedGateState {
                     next_seq: start,
+                    in_progress: None,
                     completed: BTreeSet::new(),
                 }),
                 notify: Notify::new(),
@@ -38,8 +40,9 @@ impl OrderedGate {
         loop {
             let notified = self.inner.notify.notified();
             {
-                let state = self.inner.state.lock().expect("ordered gate poisoned");
-                if state.next_seq == seq {
+                let mut state = self.inner.state.lock().expect("ordered gate poisoned");
+                if state.next_seq == seq && state.in_progress != Some(seq) {
+                    state.in_progress = Some(seq);
                     return OrderedTurn {
                         inner: self.inner.clone(),
                         seq,
@@ -91,6 +94,9 @@ impl OrderedGateInner {
         let mut state = self.state.lock().expect("ordered gate poisoned");
         if seq < state.next_seq {
             return;
+        }
+        if state.in_progress == Some(seq) {
+            state.in_progress = None;
         }
 
         state.completed.insert(seq);

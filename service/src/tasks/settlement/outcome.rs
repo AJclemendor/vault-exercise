@@ -1,3 +1,7 @@
+use super::failure::{
+    SettlementFailureAction, abort_release_or_prune_reverted_fill,
+    settlement_confirmation_failure_action, settlement_send_failure_action,
+};
 use super::requeue::claim_and_enqueue_available_fills;
 use super::{PendingSettlement, PostSubmitFailurePolicy, PreSubmitDecision, SubmitOutcome};
 use crate::AppState;
@@ -170,10 +174,6 @@ async fn apply_settlement_confirmation_result(
                             let mut engine = state.engine.lock().await;
                             hold_unresolved_settlement(&mut engine, fill, &err);
                         }
-                        // Keep the ordered apply turn until the deferred checks
-                        // finish. Releasing the gate earlier lets later local
-                        // outcomes stale these orders before an eventually
-                        // successful receipt can be applied.
                         match await_deferred_uncertain_settlement(state, fill, tx_hash).await {
                             UncertainSettlementResolution::Succeeded => {
                                 apply_confirmed_settlement_success(state, fill).await;
@@ -352,13 +352,9 @@ async fn abort_confirmed_reverted_settlement_with_policy(
                 claim_and_enqueue_available_fills(state).await;
                 return;
             }
-            let (buyer_ok, seller_ok) = engine.prune_underfunded_fill_users(fill);
-            engine.abort_fill(fill, !buyer_ok, !seller_ok);
-            let should_requeue = buyer_ok && seller_ok;
+            abort_release_or_prune_reverted_fill(&mut engine, fill);
             drop(engine);
-            if should_requeue {
-                claim_and_enqueue_available_fills(state).await;
-            }
+            claim_and_enqueue_available_fills(state).await;
         }
         PostSubmitFailurePolicy::StaleBothOrders => {
             engine.abort_fill(fill, true, true);
@@ -451,26 +447,6 @@ async fn refresh_after_failed_settlement(state: &AppState, fill: &FillCandidate)
     let engine = state.engine.lock().await;
     let (buyer_ok, seller_ok) = engine.users_funded_for_reserved(fill);
     Ok(buyer_ok && seller_ok)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SettlementFailureAction {
-    AbortKnownFailure,
-    HoldUncertainOutcome,
-}
-
-fn settlement_confirmation_failure_action(
-    err: &SettlementConfirmationError,
-) -> SettlementFailureAction {
-    if err.outcome_is_uncertain() {
-        SettlementFailureAction::HoldUncertainOutcome
-    } else {
-        SettlementFailureAction::AbortKnownFailure
-    }
-}
-
-fn settlement_send_failure_action() -> SettlementFailureAction {
-    SettlementFailureAction::AbortKnownFailure
 }
 
 async fn refresh_after_success(state: &AppState, fill: &FillCandidate) -> Result<()> {

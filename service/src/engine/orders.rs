@@ -8,6 +8,32 @@ use super::math::{reservation_for, sub_or_zero};
 use super::{Engine, FillCandidate, Order, OrderAdmission};
 
 impl Engine {
+    pub(crate) fn validate_order_request(
+        request: &SubmitOrderRequest,
+    ) -> std::result::Result<(), ApiError> {
+        if request.size.is_zero() {
+            return Err(ApiError::BadRequest(
+                "order size must be greater than zero".into(),
+            ));
+        }
+        if request.price.is_zero() {
+            return Err(ApiError::BadRequest(
+                "order price must be greater than zero".into(),
+            ));
+        }
+        if reservation_for(request.side, request.price, request.size).is_none() {
+            return Err(ApiError::BadRequest(
+                "order notional is too large to reserve safely".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_order_shape_rejection(&mut self) {
+        self.stats.orders_received += 1;
+        self.record_order_rejected_bad_request();
+    }
+
     pub(crate) fn submit_order(
         &mut self,
         request: SubmitOrderRequest,
@@ -33,24 +59,13 @@ impl Engine {
     ) -> std::result::Result<OrderAdmission, ApiError> {
         self.stats.orders_received += 1;
 
-        if request.size.is_zero() {
-            self.record_order_rejected_bad_request();
-            return Err(ApiError::BadRequest(
-                "order size must be greater than zero".into(),
-            ));
-        }
-        if request.price.is_zero() {
-            self.record_order_rejected_bad_request();
-            return Err(ApiError::BadRequest(
-                "order price must be greater than zero".into(),
-            ));
-        }
-
-        let Some(required) = reservation_for(request.side, request.price, request.size) else {
-            self.record_order_rejected_bad_request();
-            return Err(ApiError::BadRequest(
-                "order notional is too large to reserve safely".into(),
-            ));
+        let required = match Self::validate_order_request(&request) {
+            Ok(()) => reservation_for(request.side, request.price, request.size)
+                .expect("validated order reservation should be bounded"),
+            Err(err) => {
+                self.record_order_rejected_bad_request();
+                return Err(err);
+            }
         };
         let stale_balance = {
             let balance = self.balances.entry(request.user).or_default();
@@ -164,11 +179,17 @@ impl Engine {
         &mut self,
         order_id: &str,
         fills: &[FillCandidate],
+        first_unsent: usize,
     ) {
-        for fill in fills {
-            self.abort_fill(fill, false, false);
+        for fill in fills.iter().skip(first_unsent) {
+            if self.fill_still_pending(fill) {
+                self.record_settlement_aborted_before_tx();
+                self.abort_fill(fill, false, false);
+            }
         }
-        let _ = self.cancel_order(order_id);
+        if first_unsent == 0 {
+            let _ = self.cancel_order(order_id);
+        }
     }
 
     pub(crate) fn open_orders(&self, user: Option<Address>) -> Vec<OrderView> {
@@ -332,9 +353,16 @@ impl Engine {
         }
 
         let retained_size = order_snapshot.filled_size + order_snapshot.in_flight_size;
-        let release_size = sub_or_zero(order_snapshot.size, retained_size);
-        let release = reservation_for(order_snapshot.side, order_snapshot.price, release_size)
-            .expect("stored order reservation should be bounded");
+        let old_required = reservation_for(
+            order_snapshot.side,
+            order_snapshot.price,
+            order_snapshot.total_remaining(),
+        )
+        .expect("stored order reservation should be bounded");
+        let retained_required =
+            reservation_for(order_snapshot.side, order_snapshot.price, retained_size)
+                .expect("stored order reservation should be bounded");
+        let release = sub_or_zero(old_required, retained_required);
 
         if let Some(order) = self.orders.get_mut(order_id) {
             order.size = retained_size;
