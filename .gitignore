@@ -24,3 +24,4 @@ node_modules/
 docs/stats/README.md
 !notes_wip.md
 *markdown
+*.pdf

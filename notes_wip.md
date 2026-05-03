@@ -112,7 +112,7 @@ flowchart LR
     Settlement --> Chain["chain.rs<br/>RPC, balances, matchOrders"]
     Chain --> Blockchain["Token + Vault<br/>contracts"]
 
-    Chain --> BalanceRefresh["tasks.rs<br/>Balance refresh / log polling"]
+    BalanceRefresh["tasks.rs<br/>Balance refresh / log polling"] --> Chain
     BalanceRefresh --> Balances
     Routes --> Stats["stats.rs + engine/snapshot.rs<br/>/stats snapshots"]
 ```
@@ -176,22 +176,31 @@ sequenceDiagram
         T->>E: claim_fill_batch()
         E-->>T: newly available fills
         T->>Q: settlement_queue.send(requeued fills)
-    else revert or failed send
-        T->>E: abort_fill()
-        opt release/prune path can still match
+    else send failed before tx hash
+        T->>E: mark_dirty() + abort_fill(stale both)
+    else confirmed revert
+        T->>E: abort_fill(), release/prune or stale per policy
+        opt release/prune policy can still match
             T->>E: claim_fill_batch()
             E-->>T: newly available fills
             T->>Q: settlement_queue.send(requeued fills)
         end
     else uncertain receipt
-        T->>E: hold_unresolved_settlement()
-        T->>C: settlement_receipt_status(tx_hash)
-        alt later success
+        T->>C: settlement_receipt_status(tx_hash), immediate rechecks
+        alt receipt resolves success
             T->>E: apply_settlement_success()
-        else later revert
+        else receipt resolves revert
             T->>E: abort_fill()
-        else timeout unresolved
-            T->>E: time_out_unresolved_settlement()
+        else still unresolved
+            T->>E: hold_unresolved_settlement()
+            T->>C: settlement_receipt_status(tx_hash), deferred rechecks
+            alt deferred success
+                T->>E: apply_settlement_success()
+            else deferred revert
+                T->>E: abort_fill()
+            else deferred timeout
+                T->>E: time_out_unresolved_settlement()
+            end
         end
     end
 ```
