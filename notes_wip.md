@@ -193,8 +193,6 @@ sequenceDiagram
 ```
 # 4. Design choices 
 
-Many of these design choices I believe have good arguments on both sides. I'll explain the reasoning behind my decisions and why, in this context, I believe the tradeoffs are worthwhile.
-
 
 ## Harness edits
 
@@ -229,6 +227,18 @@ Because market orders create immediate settlement risk, accepting one can make o
 Limit orders add their full notional or base requirement to `reserved` at placement, but resting limits are not hard-locked for later admission. This means a user with `$100` can place multiple individually affordable limits, such as ten `$90` orders, and become over-reserved.
 
 That overbooking is deliberate because it lets users express multiple resting intents with the same balance, supports laddered quotes across price levels, and makes the book deeper for matching and price discovery. The tradeoff is that not every visible resting order is guaranteed to remain fundable after other fills or balance changes. The service handles this by treating market orders and in-flight fills as hard locks, then pruning or staling live orders after balance refreshes, settlement success, and failed settlement paths when refreshed `reserved > real`.
+
+### Cache
+
+I used a hybrid caching strategy because the service needs two things that pull in opposite directions: fresh enough balances to reject bad orders, and low enough RPC load to survive high-concurrency order flow. Reading the chain for every user on every loop would be too slow and expensive, but trusting a plain time-based cache would admit too many orders against stale balances.
+
+The cache therefore combines three signals:
+
+- **Time-based freshness:** cached balances expire after a short admission window.
+- **Dirty marking:** token/vault logs mark known users dirty when transfers, matches, or withdrawals may have changed their balances.
+- **Targeted active refresh:** the background loop only refreshes users with reserved balances, prioritizing dirty users first and then the oldest cache entries.
+
+Admission uses the cache only when it exists, is not dirty, and is recent enough. Settlement is stricter: before submitting `Vault.matchOrders(...)`, the worker refreshes both sides again and checks that the fill is still fundable. This keeps the fast path cheap while still forcing fresh reads at the points where stale data would be most dangerous.
 
 
 
@@ -337,12 +347,24 @@ The reason for holding locks during uncertainty is accounting safety. Once a tra
 
 On-chain balances can change underneath the service, so the goal is to keep cached balances fresh enough for admission and settlement without polling every user continuously.
 
-The service treats a cached balance as admission-fresh only if it exists, is not dirty, and was refreshed recently enough. On `POST /orders`, the route checks the user's cache before and after the admission ticket waits for its turn. If the entry is missing, dirty, or too old, the service reads the user's ERC20 balance and Vault balance from chain, records the block number, and updates the cache before relying on it.
+A cached balance is trusted for admission only if it:
 
-Users with reserved balances get extra attention because they have open orders or in-flight fills. The active refresh loop only considers those users, prioritizing dirty cache entries first and then the oldest stale entries. After a successful refresh, it also prunes orders if the refreshed balance no longer supports the user's reservations.
+- Exists.
+- Is not marked dirty.
+- Was refreshed within the admission freshness window.
 
-The service also polls chain logs for token and vault activity. Transfers and matches mark both indexed users dirty; withdrawals mark the withdrawing user dirty. Dirty marking is block-aware: a refresh only clears dirty state if it was read at or after the dirty event's block. This avoids accidentally trusting an older balance read after a newer chain event.
+On `POST /orders`, the route checks the user's cache before and after waiting for the admission ticket. If the cache is missing, dirty, or too old, the service reads the user's ERC20 balance and Vault balance from chain, records the block number, and updates the cache before relying on it.
+
+The service keeps balances fresh through three paths:
+
+- **Admission refresh:** refreshes the submitting user before order admission when their cache is stale, dirty, or missing.
+- **Active refresh loop:** only considers users with reserved balances, prioritizing dirty entries first and then the oldest stale entries. After refresh, it prunes orders if the refreshed balance no longer supports the user's reservations.
+- **Log-based dirty marking:** polls token and vault logs. Transfers and matches mark both indexed users dirty; withdrawals mark the withdrawing user dirty.
+
+Dirty marking is block-aware. A refresh only clears dirty state if it was read at or after the dirty event's block, which avoids trusting an older balance read after a newer chain event.
 
 Dirty does not mean every user is refreshed immediately. It means the cached balance is no longer trusted for admission or settlement. The next admission path, pre-settlement path, or active refresh pass will refresh it before relying on it. The balance-view endpoint is separate: it reads fresh chain values for the response, but does not mutate or clear the cached balance entry.
 
-Before settlement submission, the worker refreshes both the buyer and seller again and checks that the fill is still fundable. In concurrent settlement mode, this happens as part of the pre-submit check before the ordered transaction-submit gate, so it is a safety check before broadcast rather than always the literal final instruction before `Vault.matchOrders(...)`. This reduces stale-cache failures, but balances can still change before the transaction lands on-chain, so settlement still needs revert and uncertain-receipt handling.
+Before settlement submission, the worker refreshes both the buyer and seller again and checks that the fill is still fundable. In concurrent settlement mode, this happens as part of the pre-submit check before the ordered transaction-submit gate, so it is a safety check before broadcast rather than always the literal final instruction before `Vault.matchOrders(...)`.
+
+This reduces stale-cache failures, but it does not eliminate the final race before the transaction lands on-chain, so settlement still needs revert and uncertain-receipt handling.
