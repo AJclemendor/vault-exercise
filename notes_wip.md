@@ -12,25 +12,11 @@ Also, my eyesight is lowkey dying, so I tend to log some things with color and f
 |---|---:|
 | Orders received | 50,556 |
 | Orders accepted | 38,372 / 50,556 (75.9%) |
-| Orders rejected | 12,184 / 50,556 (24.1%) |
-| Admission failures | 12,184 |
-| Insufficient balance rejects | 12,181 |
-| Stale cache rejects | 3 |
+| Orders rejected (admission failures) | 12,184 / 50,556 (24.1%) |
 | Orders matched | 18,150 / 38,372 (47.3%) |
-| Fill side events | 35,142 |
 | Settlements attempted | 17,674 / 17,681 (100.0%) |
-| Precheck passed | 17,674 / 17,674 (100.0%) |
 | Settlements reverted | 18 (0.1%) |
-| Settlement success | 17,571 |
-| Settlement pending | 85 |
-| Settlement unattempted | 7 |
 | Currently open orders | 10,492 |
-| Open status | 10,212 |
-| Partial status | 280 |
-| Lifetime accepted pct open | 27.3% |
-| Stored orders | 38,372 |
-| Indexed book IDs | 10,945 |
-| Pending engine fills | 0 |
 
 
 
