@@ -111,6 +111,22 @@ fn direct_balance_view_does_not_mutate_cached_balance_state() {
 }
 
 #[test]
+fn balance_view_serializes_virtual_without_rust_suffix() {
+    let mut engine = Engine::new();
+    let user = address(1);
+    engine.apply_balance_refresh(user, wad(10), U256::ZERO);
+
+    let json = serde_json::to_value(engine.balance_view(user))
+        .expect("balance view should serialize to JSON");
+
+    assert_eq!(
+        json["virtual"],
+        serde_json::to_value(wad(10)).expect("U256 should serialize")
+    );
+    assert!(json.get("virtual_").is_none());
+}
+
+#[test]
 fn market_order_does_not_match_counterparty_created_later() {
     let mut engine = Engine::new();
     let buyer = address(1);

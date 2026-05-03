@@ -1,8 +1,12 @@
 use super::*;
-use crate::chain::SettlementConfirmationError;
+use crate::AppState;
+use crate::chain::{ChainClient, SettlementConfirmationError};
 use crate::engine::Engine;
+use crate::sequencing::AdmissionSequencer;
 use crate::types::{OrderStatus, OrderType, Side, SubmitOrderRequest};
 use alloy::primitives::{Address, U256};
+use std::sync::Arc;
+use tokio::sync::{Mutex, mpsc};
 
 fn address(byte: u8) -> Address {
     Address::from([byte; 20])
@@ -168,4 +172,58 @@ fn send_failures_abort_fill_state_without_tx_hash() {
         settlement_send_failure_action(),
         SettlementFailureAction::AbortKnownFailure
     );
+}
+
+#[tokio::test]
+async fn released_crossed_orders_are_requeued_for_settlement() {
+    let buyer = address(1);
+    let seller = address(2);
+    let mut engine = Engine::new();
+    engine.apply_balance_refresh(buyer, wad(20), U256::ZERO);
+    engine.apply_balance_refresh(seller, wad(10), U256::ZERO);
+    let buy_id = submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+    let sell_id = submit(
+        &mut engine,
+        seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+    let released = engine.next_fill_candidate().expect("orders should cross");
+    engine.abort_fill(&released, false, false);
+
+    let (settlement_queue, mut settlement_rx) = mpsc::unbounded_channel();
+    let state = AppState {
+        engine: Arc::new(Mutex::new(engine)),
+        chain: test_chain_client(),
+        admission: Arc::new(AdmissionSequencer::new()),
+        settlement_queue,
+    };
+
+    super::super::requeue::claim_and_enqueue_available_fills(&state).await;
+    let requeued = settlement_rx
+        .recv()
+        .await
+        .expect("released cross should be requeued");
+
+    assert_eq!(requeued.buy_id, buy_id);
+    assert_eq!(requeued.sell_id, sell_id);
+}
+
+fn test_chain_client() -> ChainClient {
+    ChainClient::new(
+        "http://127.0.0.1:8545".into(),
+        "0x0000000000000000000000000000000000000001".into(),
+        "0x0000000000000000000000000000000000000002".into(),
+        "0x1111111111111111111111111111111111111111111111111111111111111111".into(),
+    )
+    .expect("test chain client config should be valid")
 }

@@ -23,6 +23,7 @@ impl Engine {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn apply_balance_refresh(&mut self, user: Address, real: U256, vault: U256) {
         self.apply_balance_refresh_at_block(user, real, vault, u64::MAX);
     }
@@ -57,6 +58,7 @@ impl Engine {
         balance.last_refresh_block = Some(block);
     }
 
+    #[cfg(test)]
     pub(crate) fn balance_view(&self, user: Address) -> BalanceView {
         let Some(balance) = self.balances.get(&user) else {
             return BalanceView {
