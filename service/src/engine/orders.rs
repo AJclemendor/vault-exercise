@@ -46,8 +46,6 @@ impl Engine {
             ));
         }
 
-        self.prune_user_to_balance(request.user, None);
-
         let Some(required) = reservation_for(request.side, request.price, request.size) else {
             self.record_order_rejected_bad_request();
             return Err(ApiError::BadRequest(
@@ -64,6 +62,8 @@ impl Engine {
                 "balance cache is not fresh enough for admission".into(),
             ));
         }
+
+        self.prune_user_to_balance(request.user, None);
 
         let available = self.hard_available_for_user(request.user);
         if available < required {
@@ -178,6 +178,8 @@ impl Engine {
         if !order_snapshot.is_live() {
             return;
         }
+
+        self.release_related_in_flight_fills(order_id);
 
         let release = reservation_for(
             order_snapshot.side,

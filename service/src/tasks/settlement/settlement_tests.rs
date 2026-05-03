@@ -7,6 +7,7 @@ use crate::types::{OrderStatus, OrderType, Side, SubmitOrderRequest};
 use alloy::primitives::{Address, U256};
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
+use tokio::time::{Duration, timeout};
 
 fn address(byte: u8) -> Address {
     Address::from([byte; 20])
@@ -174,6 +175,19 @@ fn send_failures_abort_fill_state_without_tx_hash() {
     );
 }
 
+#[test]
+fn settlement_mode_config_reads_mode_source() {
+    let concurrent =
+        super::super::SettlementConfig::from_sources(Some("concurrent"), |_, default| default);
+    assert_eq!(concurrent.mode, super::super::SettlementMode::Concurrent);
+    assert_eq!(concurrent.concurrency, 16);
+
+    let sequential =
+        super::super::SettlementConfig::from_sources(Some("sequential"), |_, default| default);
+    assert_eq!(sequential.mode, super::super::SettlementMode::Sequential);
+    assert_eq!(sequential.concurrency, 1);
+}
+
 #[tokio::test]
 async fn released_crossed_orders_are_requeued_for_settlement() {
     let buyer = address(1);
@@ -218,9 +232,57 @@ async fn released_crossed_orders_are_requeued_for_settlement() {
     assert_eq!(requeued.sell_id, sell_id);
 }
 
+#[tokio::test]
+async fn pre_submit_refresh_failure_requeues_released_cross() {
+    let buyer = address(1);
+    let seller = address(2);
+    let mut engine = Engine::new();
+    engine.apply_balance_refresh(buyer, wad(20), U256::ZERO);
+    engine.apply_balance_refresh(seller, wad(10), U256::ZERO);
+    let buy_id = submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+    let sell_id = submit(
+        &mut engine,
+        seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+    let released = engine.next_fill_candidate().expect("orders should cross");
+
+    let (settlement_queue, mut settlement_rx) = mpsc::unbounded_channel();
+    let state = AppState {
+        engine: Arc::new(Mutex::new(engine)),
+        chain: test_chain_client_with_rpc("http://127.0.0.1:1"),
+        admission: Arc::new(AdmissionSequencer::new()),
+        settlement_queue,
+    };
+
+    process_fill(&state, &released).await;
+    let requeued = timeout(Duration::from_secs(1), settlement_rx.recv())
+        .await
+        .expect("released cross should be requeued after refresh failure")
+        .expect("settlement queue should stay open");
+
+    assert_eq!(requeued.buy_id, buy_id);
+    assert_eq!(requeued.sell_id, sell_id);
+    assert_ne!(requeued.seq, released.seq);
+}
+
 fn test_chain_client() -> ChainClient {
+    test_chain_client_with_rpc("http://127.0.0.1:8545")
+}
+
+fn test_chain_client_with_rpc(rpc_url: &str) -> ChainClient {
     ChainClient::new(
-        "http://127.0.0.1:8545".into(),
+        rpc_url.into(),
         "0x0000000000000000000000000000000000000001".into(),
         "0x0000000000000000000000000000000000000002".into(),
         "0x1111111111111111111111111111111111111111111111111111111111111111".into(),

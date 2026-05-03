@@ -66,7 +66,13 @@ struct SettlementConfig {
 
 impl SettlementConfig {
     fn from_env() -> Self {
-        let mode = SettlementMode::default_mode();
+        Self::from_sources(env::var("SETTLEMENT_MODE").ok().as_deref(), parse_usize_env)
+    }
+
+    fn from_sources(mode_value: Option<&str>, parse_usize: impl Fn(&str, usize) -> usize) -> Self {
+        let mode = mode_value
+            .map(SettlementMode::parse)
+            .unwrap_or_else(SettlementMode::default_mode);
         let default_concurrency = if mode == SettlementMode::Concurrent {
             16
         } else {
@@ -74,11 +80,11 @@ impl SettlementConfig {
         };
         Self {
             mode,
-            concurrency: parse_usize_env("SETTLEMENT_CONCURRENCY", default_concurrency).max(1),
-            receipt_concurrency: parse_usize_env("SETTLEMENT_RECEIPT_CONCURRENCY", 64).max(1),
-            max_unresolved_settlements: parse_usize_env("MAX_UNRESOLVED_SETTLEMENTS", 64).max(1),
-            max_inflight_fills: parse_usize_env("MAX_INFLIGHT_FILLS", 64).max(1),
-            max_fill_claim_batch: parse_usize_env("MAX_FILL_CLAIM_BATCH", 16).max(1),
+            concurrency: parse_usize("SETTLEMENT_CONCURRENCY", default_concurrency).max(1),
+            receipt_concurrency: parse_usize("SETTLEMENT_RECEIPT_CONCURRENCY", 64).max(1),
+            max_unresolved_settlements: parse_usize("MAX_UNRESOLVED_SETTLEMENTS", 64).max(1),
+            max_inflight_fills: parse_usize("MAX_INFLIGHT_FILLS", 64).max(1),
+            max_fill_claim_batch: parse_usize("MAX_FILL_CLAIM_BATCH", 16).max(1),
         }
     }
 }
@@ -162,6 +168,7 @@ async fn receipt_concurrent_settlement_loop(
             PreSubmitDecision::Abort => {
                 apply_gate.complete(fill.seq);
                 drop(unresolved_permit);
+                claim_and_enqueue_available_fills(&state).await;
                 continue;
             }
             PreSubmitDecision::Submit => {}
@@ -171,6 +178,7 @@ async fn receipt_concurrent_settlement_loop(
             SubmitOutcome::SendFailed => {
                 apply_gate.complete(fill.seq);
                 drop(unresolved_permit);
+                claim_and_enqueue_available_fills(&state).await;
             }
             SubmitOutcome::Submitted(pending) => {
                 let receipt_permit = receipt_permits
@@ -330,6 +338,8 @@ fn spawn_concurrent_settlement_worker(args: SettlementWorkerArgs) {
             args.reorder_state.record_event(args.fill.seq);
             drop(tx_turn);
             args.apply_gate.complete(args.fill.seq);
+            drop(_user_guard);
+            claim_and_enqueue_available_fills(&args.state).await;
             return;
         }
 
@@ -340,6 +350,7 @@ fn spawn_concurrent_settlement_worker(args: SettlementWorkerArgs) {
             SubmitOutcome::SendFailed => {
                 args.reorder_state.record_event(args.fill.seq);
                 args.apply_gate.complete(args.fill.seq);
+                claim_and_enqueue_available_fills(&args.state).await;
             }
             SubmitOutcome::Submitted(pending) => {
                 let _receipt_permit = args

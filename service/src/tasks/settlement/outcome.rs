@@ -12,10 +12,12 @@ use tokio::sync::OwnedSemaphorePermit;
 
 pub(super) async fn process_fill(state: &AppState, fill: &FillCandidate) {
     if prepare_fill_for_submit(state, fill).await == PreSubmitDecision::Abort {
+        claim_and_enqueue_available_fills(state).await;
         return;
     }
 
     let SubmitOutcome::Submitted(pending) = submit_settlement_once(state, fill).await else {
+        claim_and_enqueue_available_fills(state).await;
         return;
     };
 
@@ -189,6 +191,8 @@ async fn apply_settlement_confirmation_result(
                             UncertainSettlementResolution::Unresolved => {
                                 let mut engine = state.engine.lock().await;
                                 time_out_unresolved_settlement(&mut engine, fill);
+                                drop(engine);
+                                claim_and_enqueue_available_fills(state).await;
                                 return;
                             }
                         }
@@ -353,6 +357,8 @@ async fn abort_confirmed_reverted_settlement_with_policy(
         }
         PostSubmitFailurePolicy::StaleBothOrders => {
             engine.abort_fill(fill, true, true);
+            drop(engine);
+            claim_and_enqueue_available_fills(state).await;
         }
     }
 }

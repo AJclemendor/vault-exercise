@@ -67,7 +67,9 @@ impl Engine {
                     && order.available_remaining() > U256::ZERO
                     && !self.user_has_in_flight_order(order.user)
                 {
-                    size += order.available_remaining();
+                    size = size
+                        .checked_add(order.available_remaining())
+                        .unwrap_or(U256::MAX);
                     orders += 1;
                 }
             }

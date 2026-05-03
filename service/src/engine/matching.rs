@@ -7,7 +7,7 @@ use super::{Engine, FillCandidate, Order};
 
 impl Engine {
     pub(crate) fn claim_next_fill_candidate(&mut self) -> Option<FillCandidate> {
-        if let Some(fill) = self.pending_fills.pop_front() {
+        if let Some(fill) = self.pop_pending_fill() {
             return Some(fill);
         }
         self.next_fill_candidate()
@@ -25,7 +25,7 @@ impl Engine {
     }
 
     pub(crate) fn next_fill_candidate(&mut self) -> Option<FillCandidate> {
-        if let Some(fill) = self.pending_fills.pop_front() {
+        if let Some(fill) = self.pop_pending_fill() {
             return Some(fill);
         }
 
@@ -250,6 +250,7 @@ impl Engine {
 
         self.add_order_in_flight(&buy_id, fill_size);
         self.add_order_in_flight(&sell_id, fill_size);
+        self.track_in_flight_fill(&candidate);
 
         self.stats.fill_candidates += 1;
         Some(candidate)
@@ -351,6 +352,7 @@ impl Engine {
         if !self.fill_still_pending(fill) {
             return;
         }
+        self.untrack_in_flight_fill(fill.seq);
 
         let matched_orders = self.apply_order_fill(&fill.buy_id, fill.fill_size) as u64
             + self.apply_order_fill(&fill.sell_id, fill.fill_size) as u64;
@@ -435,6 +437,8 @@ impl Engine {
     }
 
     pub(crate) fn abort_fill(&mut self, fill: &FillCandidate, stale_buy: bool, stale_sell: bool) {
+        self.untrack_in_flight_fill(fill.seq);
+
         if stale_buy {
             self.terminal_order(&fill.buy_id, OrderStatus::Stale);
         } else {
@@ -445,14 +449,6 @@ impl Engine {
             self.terminal_order(&fill.sell_id, OrderStatus::Stale);
         } else {
             self.release_inflight(&fill.sell_id, fill.fill_size);
-        }
-    }
-
-    fn release_inflight(&mut self, order_id: &str, fill_size: U256) {
-        let cancel_after_release = self.subtract_order_in_flight(order_id, fill_size);
-
-        if cancel_after_release {
-            self.terminal_order(order_id, OrderStatus::Cancelled);
         }
     }
 

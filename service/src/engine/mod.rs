@@ -1,6 +1,7 @@
 mod balances;
 mod book;
 mod exposure;
+mod inflight;
 mod matching;
 mod math;
 mod orders;
@@ -103,6 +104,7 @@ pub(crate) struct Engine {
     balances: HashMap<Address, BalanceState>,
     live_order_ids_by_user: HashMap<Address, HashSet<String>>,
     in_flight_orders_by_user: HashMap<Address, usize>,
+    in_flight_fills: HashMap<u64, FillCandidate>,
     pending_fills: VecDeque<FillCandidate>,
     next_order_seq: u64,
     next_fill_seq: u64,
@@ -118,6 +120,7 @@ impl Engine {
             balances: HashMap::new(),
             live_order_ids_by_user: HashMap::new(),
             in_flight_orders_by_user: HashMap::new(),
+            in_flight_fills: HashMap::new(),
             pending_fills: VecDeque::new(),
             next_order_seq: 1,
             next_fill_seq: 1,

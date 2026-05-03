@@ -130,7 +130,7 @@ fn direct_balance_view_does_not_mutate_cached_balance_state() {
 }
 
 #[test]
-fn balance_view_serializes_virtual_without_rust_suffix() {
+fn balance_view_serializes_virtual_with_harness_field_name() {
     let mut engine = Engine::new();
     let user = address(1);
     engine.apply_balance_refresh(user, wad(10), U256::ZERO);
@@ -139,10 +139,10 @@ fn balance_view_serializes_virtual_without_rust_suffix() {
         .expect("balance view should serialize to JSON");
 
     assert_eq!(
-        json["virtual"],
+        json["virtual_"],
         serde_json::to_value(wad(10)).expect("U256 should serialize")
     );
-    assert!(json.get("virtual_").is_none());
+    assert!(json.get("virtual").is_none());
 }
 
 #[test]
@@ -363,6 +363,45 @@ fn external_balance_drop_stales_overbooked_limits_that_no_longer_fit() {
     assert_eq!(engine.orders[&first].status, OrderStatus::Stale);
     assert_eq!(engine.orders[&second].status, OrderStatus::Stale);
     assert_eq!(engine.open_orders(Some(buyer)).len(), 0);
+}
+
+#[test]
+fn stale_balance_rejection_does_not_prune_existing_orders() {
+    let mut engine = Engine::new();
+    let buyer = address(1);
+    engine.apply_balance_refresh(buyer, wad(100), U256::ZERO);
+
+    let first = submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(90),
+    );
+    let second = submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(90),
+    );
+    engine.apply_balance_refresh(buyer, wad(80), U256::ZERO);
+    engine.mark_dirty(buyer);
+
+    let result = engine.submit_order(SubmitOrderRequest {
+        user: buyer,
+        side: Side::Buy,
+        order_type: OrderType::Limit,
+        price: wad(1),
+        size: wad(1),
+    });
+
+    assert!(matches!(result, Err(ApiError::Chain(_))));
+    assert_eq!(engine.orders[&first].status, OrderStatus::Open);
+    assert_eq!(engine.orders[&second].status, OrderStatus::Open);
+    assert_eq!(engine.stats.orders_marked_stale, 0);
 }
 
 #[test]
@@ -1041,6 +1080,63 @@ fn in_flight_order_is_not_selected_for_another_fill() {
 }
 
 #[test]
+fn stale_abort_releases_other_fills_for_same_order() {
+    let mut engine = Engine::new();
+    let buyer = address(1);
+    let first_seller = address(2);
+    let second_seller = address(3);
+    engine.apply_balance_refresh(buyer, wad(20), U256::ZERO);
+    engine.apply_balance_refresh(first_seller, wad(10), U256::ZERO);
+    engine.apply_balance_refresh(second_seller, wad(10), U256::ZERO);
+
+    submit(
+        &mut engine,
+        first_seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+    let second_sell_id = submit(
+        &mut engine,
+        second_seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+    let admission = engine
+        .submit_order_and_claim_fills(SubmitOrderRequest {
+            user: buyer,
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            price: wad(1),
+            size: wad(20),
+        })
+        .expect("large taker should be accepted");
+    assert_eq!(admission.fills.len(), 2);
+    assert_eq!(engine.orders[&second_sell_id].in_flight_size, wad(10));
+
+    engine.abort_fill(&admission.fills[0], true, false);
+
+    assert_eq!(
+        engine.orders[&admission.fills[0].buy_id].status,
+        OrderStatus::Stale
+    );
+    assert_eq!(engine.orders[&second_sell_id].status, OrderStatus::Open);
+    assert_eq!(engine.orders[&second_sell_id].in_flight_size, U256::ZERO);
+    assert!(!engine.fill_still_pending(&admission.fills[1]));
+
+    engine
+        .cancel_order(&second_sell_id)
+        .expect("released counterparty should cancel");
+    assert_eq!(
+        engine.orders[&second_sell_id].status,
+        OrderStatus::Cancelled
+    );
+}
+
+#[test]
 fn fill_candidates_receive_monotonic_sequence_numbers() {
     let mut engine = Engine::new();
     let buyer_one = address(1);
@@ -1707,6 +1803,25 @@ fn buy_order_with_overflowing_notional_is_rejected() {
 }
 
 #[test]
+fn max_size_buy_at_one_wad_is_accepted() {
+    let mut engine = Engine::new();
+    let buyer = address(1);
+    engine.apply_balance_refresh(buyer, U256::MAX, U256::ZERO);
+
+    let order_id = submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        U256::MAX,
+    );
+
+    assert_eq!(engine.orders[&order_id].status, OrderStatus::Open);
+    assert_eq!(engine.balance_view(buyer).reserved, U256::MAX);
+}
+
+#[test]
 fn sell_reservation_accounting_overflow_is_rejected() {
     let mut engine = Engine::new();
     let seller = address(1);
@@ -1751,4 +1866,36 @@ fn book_snapshot_midpoint_handles_large_prices() {
     assert_eq!(snapshot.best_ask_raw, Some(U256::MAX));
     assert_eq!(snapshot.mid_raw, Some(U256::MAX - U256::from(1u8)));
     assert_eq!(snapshot.spread_raw, Some(U256::from(1u8)));
+}
+
+#[test]
+fn book_snapshot_saturates_level_size_on_overflow() {
+    let mut engine = Engine::new();
+    let first_seller = address(1);
+    let second_seller = address(2);
+    engine.apply_balance_refresh(first_seller, U256::MAX, U256::ZERO);
+    engine.apply_balance_refresh(second_seller, U256::MAX, U256::ZERO);
+
+    submit(
+        &mut engine,
+        first_seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        U256::MAX,
+    );
+    submit(
+        &mut engine,
+        second_seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        U256::MAX,
+    );
+
+    let snapshot = engine.book_snapshot(1);
+
+    assert_eq!(snapshot.asks.len(), 1);
+    assert_eq!(snapshot.asks[0].orders, 2);
+    assert_eq!(snapshot.asks[0].size_raw, U256::MAX);
 }

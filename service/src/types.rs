@@ -48,7 +48,6 @@ pub(crate) struct OrderResponse {
 pub(crate) struct BalanceView {
     pub(crate) real: U256,
     pub(crate) reserved: U256,
-    #[serde(rename = "virtual")]
     pub(crate) virtual_: U256,
     pub(crate) deficit: U256,
     pub(crate) over_reserved: bool,

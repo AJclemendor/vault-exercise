@@ -1,5 +1,5 @@
 use crate::types::Side;
-use alloy::primitives::U256;
+use alloy::primitives::{U256, U512};
 
 use super::WAD;
 
@@ -48,9 +48,13 @@ fn ceil_mul_div(left: U256, right: U256, denominator: U256) -> Option<U256> {
     if denominator.is_zero() {
         return None;
     }
-    let product = left.checked_mul(right)?;
+    let product = U512::from(left) * U512::from(right);
     if product.is_zero() {
         return Some(U256::ZERO);
     }
-    Some(((product - U256::from(1u8)) / denominator) + U256::from(1u8))
+    let result = ((product - U512::from(1u8)) / U512::from(denominator)) + U512::from(1u8);
+    if result > U512::from(U256::MAX) {
+        return None;
+    }
+    Some(result.to::<U256>())
 }
