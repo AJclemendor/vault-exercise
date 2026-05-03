@@ -243,15 +243,7 @@ That overbooking is deliberate because it lets users express multiple resting in
 
 ### Cache
 
-I used a hybrid caching strategy because the service needs two things that pull in opposite directions: fresh enough balances to reject bad orders, and low enough RPC load to survive high-concurrency order flow. Reading the chain for every user on every loop would be too slow and expensive, but trusting a plain time-based cache would admit too many orders against stale balances.
-
-The cache therefore combines three signals:
-
-- **Time-based freshness:** cached balances expire after a short admission window.
-- **Dirty marking:** token/vault logs mark known users dirty when transfers, matches, or withdrawals may have changed their balances.
-- **Targeted active refresh:** the background loop only refreshes users with reserved balances, prioritizing dirty users first and then the oldest cache entries.
-
-Admission uses the cache only when it exists, is not dirty, and is recent enough. Settlement is stricter: before submitting `Vault.matchOrders(...)`, the worker refreshes both sides again and checks that the fill is still fundable. This keeps the fast path cheap while still forcing fresh reads at the points where stale data would be most dangerous.
+I used a hybrid cache because the service needs fresh enough balances to reject bad orders, but cannot afford to read the chain for every user on every loop. The design choice is to trust cached balances only when they are recent and clean, then use stricter refreshes before settlement. Section 9 covers the full reconciliation flow: admission refreshes, active refresh, log-based dirty marking, and pre-settlement balance checks.
 
 
 
