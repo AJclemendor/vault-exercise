@@ -1,3 +1,4 @@
+use super::requeue::claim_and_enqueue_available_fills;
 use super::{PendingSettlement, PostSubmitFailurePolicy, PreSubmitDecision, SubmitOutcome};
 use crate::AppState;
 use crate::chain::{SettlementConfirmationError, SettlementReceiptStatus};
@@ -167,8 +168,30 @@ async fn apply_settlement_confirmation_result(
                             let mut engine = state.engine.lock().await;
                             hold_unresolved_settlement(&mut engine, fill, &err);
                         }
-                        spawn_uncertain_settlement_reconciler(state.clone(), fill.clone(), tx_hash);
-                        return;
+                        // Keep the ordered apply turn until the deferred checks
+                        // finish. Releasing the gate earlier lets later local
+                        // outcomes stale these orders before an eventually
+                        // successful receipt can be applied.
+                        match await_deferred_uncertain_settlement(state, fill, tx_hash).await {
+                            UncertainSettlementResolution::Succeeded => {
+                                apply_confirmed_settlement_success(state, fill).await;
+                                return;
+                            }
+                            UncertainSettlementResolution::Reverted => {
+                                abort_confirmed_reverted_settlement_with_policy(
+                                    state,
+                                    fill,
+                                    post_submit_failure_policy,
+                                )
+                                .await;
+                                return;
+                            }
+                            UncertainSettlementResolution::Unresolved => {
+                                let mut engine = state.engine.lock().await;
+                                time_out_unresolved_settlement(&mut engine, fill);
+                                return;
+                            }
+                        }
                     }
                 }
             }
@@ -272,49 +295,6 @@ fn hold_unresolved_settlement(
     engine.mark_dirty(fill.seller);
 }
 
-fn spawn_uncertain_settlement_reconciler(state: AppState, fill: FillCandidate, tx_hash: TxHash) {
-    tokio::spawn(async move {
-        let tuning = receipt_tuning();
-        for attempt in 1..=tuning.deferred_rechecks {
-            tokio::time::sleep(tuning.deferred_recheck_interval).await;
-            match state.chain.settlement_receipt_status(tx_hash).await {
-                Ok(Some(SettlementReceiptStatus::Succeeded)) => {
-                    eprintln!(
-                        "[settlement] deferred receipt resolved success seq={} tx={} attempt={}",
-                        fill.seq, tx_hash, attempt
-                    );
-                    apply_confirmed_settlement_success(&state, &fill).await;
-                    return;
-                }
-                Ok(Some(SettlementReceiptStatus::Reverted)) => {
-                    eprintln!(
-                        "[settlement] deferred receipt resolved revert seq={} tx={} attempt={}",
-                        fill.seq, tx_hash, attempt
-                    );
-                    abort_confirmed_reverted_settlement(&state, &fill).await;
-                    return;
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    if attempt == 1 || attempt == tuning.deferred_rechecks {
-                        eprintln!(
-                            "[settlement] deferred receipt still unresolved seq={} tx={} attempt={}: {err:#}",
-                            fill.seq, tx_hash, attempt
-                        );
-                    }
-                }
-            }
-        }
-
-        eprintln!(
-            "[settlement] deferred receipt timed out seq={} tx={} checks={}; staling both orders",
-            fill.seq, tx_hash, tuning.deferred_rechecks
-        );
-        let mut engine = state.engine.lock().await;
-        time_out_unresolved_settlement(&mut engine, &fill);
-    });
-}
-
 fn time_out_unresolved_settlement(engine: &mut Engine, fill: &FillCandidate) {
     engine.record_settlement_receipt_failed();
     engine.record_settlement_unknown_outcome();
@@ -324,26 +304,29 @@ fn time_out_unresolved_settlement(engine: &mut Engine, fill: &FillCandidate) {
 }
 
 async fn apply_confirmed_settlement_success(state: &AppState, fill: &FillCandidate) {
-    if let Err(err) = refresh_after_success(state, fill).await {
-        eprintln!(
-            "[settlement] post-success refresh failed seq={} buy={} sell={} quote={} base={}: {err:#}",
-            fill.seq, fill.buyer, fill.seller, fill.quote, fill.base
-        );
-        let mut engine = state.engine.lock().await;
-        engine.mark_dirty(fill.buyer);
-        engine.mark_dirty(fill.seller);
-    }
+    let refreshed = match refresh_after_success(state, fill).await {
+        Ok(()) => true,
+        Err(err) => {
+            eprintln!(
+                "[settlement] post-success refresh failed seq={} buy={} sell={} quote={} base={}: {err:#}",
+                fill.seq, fill.buyer, fill.seller, fill.quote, fill.base
+            );
+            let mut engine = state.engine.lock().await;
+            engine.mark_dirty(fill.buyer);
+            engine.mark_dirty(fill.seller);
+            false
+        }
+    };
     let mut engine = state.engine.lock().await;
-    engine.apply_settlement_success(fill);
-}
-
-async fn abort_confirmed_reverted_settlement(state: &AppState, fill: &FillCandidate) {
-    abort_confirmed_reverted_settlement_with_policy(
-        state,
-        fill,
-        PostSubmitFailurePolicy::ReleaseOrPrune,
-    )
-    .await;
+    if refreshed {
+        engine.apply_settlement_success(fill);
+    } else {
+        engine.apply_settlement_success_without_balance_prune(fill);
+    }
+    drop(engine);
+    if refreshed {
+        claim_and_enqueue_available_fills(state).await;
+    }
 }
 
 async fn abort_confirmed_reverted_settlement_with_policy(
@@ -362,11 +345,58 @@ async fn abort_confirmed_reverted_settlement_with_policy(
         PostSubmitFailurePolicy::ReleaseOrPrune => {
             let (buyer_ok, seller_ok) = engine.prune_underfunded_fill_users(fill);
             engine.abort_fill(fill, !buyer_ok, !seller_ok);
+            let should_requeue = buyer_ok && seller_ok;
+            drop(engine);
+            if should_requeue {
+                claim_and_enqueue_available_fills(state).await;
+            }
         }
         PostSubmitFailurePolicy::StaleBothOrders => {
             engine.abort_fill(fill, true, true);
         }
     }
+}
+
+async fn await_deferred_uncertain_settlement(
+    state: &AppState,
+    fill: &FillCandidate,
+    tx_hash: TxHash,
+) -> UncertainSettlementResolution {
+    let tuning = receipt_tuning();
+    for attempt in 1..=tuning.deferred_rechecks {
+        tokio::time::sleep(tuning.deferred_recheck_interval).await;
+        match state.chain.settlement_receipt_status(tx_hash).await {
+            Ok(Some(SettlementReceiptStatus::Succeeded)) => {
+                eprintln!(
+                    "[settlement] deferred receipt resolved success seq={} tx={} attempt={}",
+                    fill.seq, tx_hash, attempt
+                );
+                return UncertainSettlementResolution::Succeeded;
+            }
+            Ok(Some(SettlementReceiptStatus::Reverted)) => {
+                eprintln!(
+                    "[settlement] deferred receipt resolved revert seq={} tx={} attempt={}",
+                    fill.seq, tx_hash, attempt
+                );
+                return UncertainSettlementResolution::Reverted;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                if attempt == 1 || attempt == tuning.deferred_rechecks {
+                    eprintln!(
+                        "[settlement] deferred receipt still unresolved seq={} tx={} attempt={}: {err:#}",
+                        fill.seq, tx_hash, attempt
+                    );
+                }
+            }
+        }
+    }
+
+    eprintln!(
+        "[settlement] deferred receipt timed out seq={} tx={} checks={}; staling both orders",
+        fill.seq, tx_hash, tuning.deferred_rechecks
+    );
+    UncertainSettlementResolution::Unresolved
 }
 
 pub(super) async fn refresh_for_settlement(state: &AppState, fill: &FillCandidate) -> Result<()> {
@@ -405,13 +435,6 @@ async fn refresh_after_failed_settlement(state: &AppState, fill: &FillCandidate)
     let engine = state.engine.lock().await;
     let (buyer_ok, seller_ok) = engine.users_funded_for_reserved(fill);
     Ok(buyer_ok && seller_ok)
-}
-
-fn record_settlement_confirmation_failure(engine: &mut Engine, err: &SettlementConfirmationError) {
-    match err {
-        SettlementConfirmationError::Reverted => engine.record_settlement_reverted(),
-        SettlementConfirmationError::Receipt(_) => engine.record_settlement_receipt_failed(),
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

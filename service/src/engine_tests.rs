@@ -1062,44 +1062,6 @@ fn fill_candidates_receive_monotonic_sequence_numbers() {
 }
 
 #[test]
-fn limit_pair_priority_prefers_better_prices() {
-    let better_buy = order(Side::Buy, 11, 10);
-    let worse_buy = order(Side::Buy, 10, 1);
-    let sell = order(Side::Sell, 9, 1);
-    assert_eq!(
-        limit_pair_priority((&better_buy, &sell), (&worse_buy, &sell)),
-        Ordering::Less
-    );
-
-    let buy = order(Side::Buy, 11, 1);
-    let better_sell = order(Side::Sell, 9, 10);
-    let worse_sell = order(Side::Sell, 10, 1);
-    assert_eq!(
-        limit_pair_priority((&buy, &better_sell), (&buy, &worse_sell)),
-        Ordering::Less
-    );
-}
-
-#[test]
-fn limit_pair_priority_is_fifo_within_price_levels() {
-    let older_buy = order(Side::Buy, 10, 1);
-    let newer_buy = order(Side::Buy, 10, 2);
-    let same_sell = order(Side::Sell, 9, 3);
-    assert_eq!(
-        limit_pair_priority((&newer_buy, &same_sell), (&older_buy, &same_sell)),
-        Ordering::Greater
-    );
-
-    let same_buy = order(Side::Buy, 10, 1);
-    let older_sell = order(Side::Sell, 9, 2);
-    let newer_sell = order(Side::Sell, 9, 3);
-    assert_eq!(
-        limit_pair_priority((&same_buy, &older_sell), (&same_buy, &newer_sell)),
-        Ordering::Less
-    );
-}
-
-#[test]
 fn best_crossing_limits_preserves_price_priority_before_fifo_when_skipping_self_trade() {
     let mut engine = Engine::new();
     let user_a = address(1);
@@ -1707,4 +1669,51 @@ fn buy_order_with_overflowing_notional_is_rejected() {
     assert_eq!(engine.stats.orders_accepted, 0);
     assert_eq!(engine.stats.orders_rejected, 1);
     assert!(engine.open_orders(Some(buyer)).is_empty());
+}
+
+#[test]
+fn sell_reservation_accounting_overflow_is_rejected() {
+    let mut engine = Engine::new();
+    let seller = address(1);
+    engine.apply_balance_refresh(seller, U256::MAX, U256::ZERO);
+
+    submit(
+        &mut engine,
+        seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        U256::MAX,
+    );
+    let result = engine.submit_order(SubmitOrderRequest {
+        user: seller,
+        side: Side::Sell,
+        order_type: OrderType::Limit,
+        price: wad(1),
+        size: U256::from(1u8),
+    });
+
+    assert!(matches!(result, Err(ApiError::BadRequest(_))));
+    assert_eq!(engine.stats.orders_accepted, 1);
+    assert_eq!(engine.stats.orders_rejected, 1);
+    assert_eq!(engine.balance_view(seller).reserved, U256::MAX);
+}
+
+#[test]
+fn book_snapshot_midpoint_handles_large_prices() {
+    let mut engine = Engine::new();
+    let mut buy = order(Side::Buy, 1, 1);
+    buy.price = U256::MAX - U256::from(1u8);
+    let mut sell = order(Side::Sell, 1, 2);
+    sell.price = U256::MAX;
+
+    insert_indexed(&mut engine, buy);
+    insert_indexed(&mut engine, sell);
+
+    let snapshot = engine.book_snapshot(1);
+
+    assert_eq!(snapshot.best_bid_raw, Some(U256::MAX - U256::from(1u8)));
+    assert_eq!(snapshot.best_ask_raw, Some(U256::MAX));
+    assert_eq!(snapshot.mid_raw, Some(U256::MAX - U256::from(1u8)));
+    assert_eq!(snapshot.spread_raw, Some(U256::from(1u8)));
 }

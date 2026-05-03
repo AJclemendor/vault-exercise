@@ -61,14 +61,6 @@ impl Engine {
         }
     }
 
-    pub(crate) fn stale_unsafe_live_orders_for_user(
-        &mut self,
-        user: Address,
-        exclude_order_id: Option<&str>,
-    ) {
-        self.stale_over_reserved_orders_for_user(user, exclude_order_id);
-    }
-
     pub(super) fn required_balance_after_fill_for_order(
         &self,
         user: Address,

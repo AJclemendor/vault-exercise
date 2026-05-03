@@ -73,7 +73,19 @@ impl Engine {
             )));
         }
 
-        self.balances.entry(request.user).or_default().reserved += required;
+        let Some(new_reserved) = self
+            .balances
+            .entry(request.user)
+            .or_default()
+            .reserved
+            .checked_add(required)
+        else {
+            self.record_order_rejected_bad_request();
+            return Err(ApiError::BadRequest(
+                "reserved balance accounting would overflow".into(),
+            ));
+        };
+        self.balances.entry(request.user).or_default().reserved = new_reserved;
 
         let id = format!("ord-{}", self.next_order_seq);
         let order = Order {

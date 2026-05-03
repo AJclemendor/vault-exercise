@@ -90,7 +90,6 @@ async fn admission_sequencer_commits_in_ticket_order() {
 
     for label in ["slow-first", "fast-second"] {
         let ticket = sequencer.issue_ticket();
-        let sequencer = sequencer.clone();
         let committed = committed.clone();
         let ready_tx = ready_tx.clone();
         tokio::spawn(async move {
@@ -98,7 +97,7 @@ async fn admission_sequencer_commits_in_ticket_order() {
             if label == "slow-first" {
                 tokio::time::sleep(Duration::from_millis(30)).await;
             }
-            let _turn = sequencer.wait_for_turn(ticket).await;
+            let _turn = ticket.wait_for_turn().await;
             committed.lock().await.push(label);
         });
     }
@@ -121,10 +120,35 @@ async fn admission_refresh_failure_does_not_skip_sequence() {
     let next_ticket = sequencer.issue_ticket();
 
     {
-        let _turn = sequencer.wait_for_turn(failed_ticket).await;
+        let _turn = failed_ticket.wait_for_turn().await;
     }
 
-    let _turn = sequencer.wait_for_turn(next_ticket).await;
+    let _turn = next_ticket.wait_for_turn().await;
+}
+
+#[tokio::test]
+async fn dropped_queued_admission_ticket_does_not_block_later_ticket() {
+    let sequencer = AdmissionSequencer::new();
+    let blocker = sequencer.issue_ticket();
+    let cancelled = sequencer.issue_ticket();
+    let later = sequencer.issue_ticket();
+
+    let cancelled_task = tokio::spawn(async move {
+        let _turn = cancelled.wait_for_turn().await;
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    cancelled_task.abort();
+    assert!(
+        cancelled_task
+            .await
+            .expect_err("task should be cancelled")
+            .is_cancelled()
+    );
+
+    drop(blocker);
+    let _turn = timeout(Duration::from_millis(25), later.wait_for_turn())
+        .await
+        .expect("later ticket should not wedge behind cancelled ticket");
 }
 
 #[tokio::test]
@@ -143,10 +167,9 @@ async fn submit_order_created_seq_follows_admission_ticket_order() {
     let second_ticket = sequencer.issue_ticket();
 
     let second_task = {
-        let sequencer = sequencer.clone();
         let engine = engine.clone();
         tokio::spawn(async move {
-            let _turn = sequencer.wait_for_turn(second_ticket).await;
+            let _turn = second_ticket.wait_for_turn().await;
             engine
                 .lock()
                 .await
@@ -164,7 +187,7 @@ async fn submit_order_created_seq_follows_admission_ticket_order() {
 
     tokio::time::sleep(Duration::from_millis(25)).await;
     let first_id = {
-        let _turn = sequencer.wait_for_turn(first_ticket).await;
+        let _turn = first_ticket.wait_for_turn().await;
         engine
             .lock()
             .await

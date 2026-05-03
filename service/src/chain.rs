@@ -429,3 +429,7 @@ fn address_from_topic(topic: &str) -> Option<Address> {
     }
     Address::from_str(&format!("0x{}", &hex[24..])).ok()
 }
+
+#[cfg(test)]
+#[path = "chain_tests.rs"]
+mod tests;

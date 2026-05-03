@@ -13,6 +13,7 @@ pub(crate) struct TaskTuning {
     pub(crate) log_poll_interval: Duration,
     pub(crate) stats_log_interval: Duration,
     pub(crate) active_refresh_budget: usize,
+    pub(crate) log_reorg_depth: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -43,6 +44,7 @@ pub(crate) fn task_tuning() -> TaskTuning {
         log_poll_interval: duration_ms_env("LOG_POLL_INTERVAL_MS", 250),
         stats_log_interval: duration_ms_env("STATS_LOG_INTERVAL_MS", 5_000),
         active_refresh_budget: usize_env("ACTIVE_REFRESH_BUDGET", 40).max(1),
+        log_reorg_depth: u64_env("LOG_REORG_DEPTH", 6),
     }
 }
 
@@ -68,15 +70,21 @@ fn duration_ms_env(name: &str, default_ms: u64) -> Duration {
 }
 
 fn usize_env(name: &str, default: usize) -> usize {
-    env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
+    match env::var(name) {
+        Ok(value) => value.parse().unwrap_or_else(|_| {
+            eprintln!("[config] invalid {name}={value:?}; using default {default}");
+            default
+        }),
+        Err(_) => default,
+    }
 }
 
 fn u64_env(name: &str, default: u64) -> u64 {
-    env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
+    match env::var(name) {
+        Ok(value) => value.parse().unwrap_or_else(|_| {
+            eprintln!("[config] invalid {name}={value:?}; using default {default}");
+            default
+        }),
+        Err(_) => default,
+    }
 }

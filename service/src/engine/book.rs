@@ -19,7 +19,7 @@ impl Engine {
             _ => None,
         };
         let mid_raw = match (best_bid_raw, best_ask_raw) {
-            (Some(bid), Some(ask)) => Some((bid + ask) / U256::from(2u8)),
+            (Some(bid), Some(ask)) => Some(midpoint(bid, ask)),
             _ => None,
         };
 
@@ -146,6 +146,13 @@ fn book_level(price: U256, size: U256, orders: usize) -> BookLevel {
         size_raw: size,
         orders,
     }
+}
+
+fn midpoint(left: U256, right: U256) -> U256 {
+    let two = U256::from(2u8);
+    // Avoid `left + right` so extreme but valid prices cannot overflow while
+    // computing a representable average for the public book snapshot.
+    (left / two) + (right / two) + ((left % two + right % two) / two)
 }
 
 fn should_keep_indexed_limit(

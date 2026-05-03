@@ -14,11 +14,6 @@ use alloy::primitives::{Address, U256};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::Instant;
 
-#[cfg(test)]
-use matching::limit_pair_priority;
-#[cfg(test)]
-use std::cmp::Ordering;
-
 const WAD: u128 = 1_000_000_000_000_000_000;
 
 #[derive(Debug, Clone)]

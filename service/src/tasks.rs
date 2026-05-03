@@ -65,11 +65,18 @@ pub(crate) async fn log_poll_loop(state: AppState) {
             }
         };
 
-        if latest <= last_seen {
+        if latest == 0 {
             continue;
         }
 
-        let from = last_seen + 1;
+        // Re-read a small overlap on every poll. This makes cache invalidation
+        // conservative across short reorgs without adding persistence to the
+        // exercise service.
+        let from = last_seen
+            .saturating_sub(tuning.log_reorg_depth)
+            .saturating_add(1)
+            .max(1)
+            .min(latest);
         let to = latest;
         match state.chain.dirty_users_from_logs(from, to).await {
             Ok(events) => {

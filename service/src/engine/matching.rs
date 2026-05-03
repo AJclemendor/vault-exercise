@@ -1,6 +1,4 @@
 use alloy::primitives::{Address, U256};
-#[cfg(test)]
-use std::cmp::Ordering;
 
 use crate::types::{OrderStatus, OrderType, Side};
 
@@ -346,6 +344,14 @@ impl Engine {
     }
 
     pub(crate) fn apply_settlement_success(&mut self, fill: &FillCandidate) {
+        self.apply_settlement_success_inner(fill, true);
+    }
+
+    pub(crate) fn apply_settlement_success_without_balance_prune(&mut self, fill: &FillCandidate) {
+        self.apply_settlement_success_inner(fill, false);
+    }
+
+    fn apply_settlement_success_inner(&mut self, fill: &FillCandidate, prune_balances: bool) {
         if !self.fill_still_pending(fill) {
             return;
         }
@@ -353,9 +359,11 @@ impl Engine {
         let matched_orders = self.apply_order_fill(&fill.buy_id, fill.fill_size) as u64
             + self.apply_order_fill(&fill.sell_id, fill.fill_size) as u64;
 
-        self.stale_unsafe_live_orders_for_user(fill.buyer, None);
-        if fill.seller != fill.buyer {
-            self.stale_unsafe_live_orders_for_user(fill.seller, None);
+        if prune_balances {
+            self.stale_over_reserved_orders_for_user(fill.buyer, None);
+            if fill.seller != fill.buyer {
+                self.stale_over_reserved_orders_for_user(fill.seller, None);
+            }
         }
 
         self.stats.unique_orders_with_successful_fill += matched_orders;
@@ -449,7 +457,7 @@ impl Engine {
             return;
         }
 
-        self.stale_unsafe_live_orders_for_user(user, None);
+        self.stale_over_reserved_orders_for_user(user, None);
     }
 }
 
@@ -460,31 +468,4 @@ fn execution_price(buy: &Order, sell: &Order) -> U256 {
         _ if buy.created_seq > sell.created_seq => sell.price,
         _ => buy.price,
     }
-}
-
-#[cfg(test)]
-pub(super) fn limit_pair_priority(
-    candidate: (&Order, &Order),
-    current: (&Order, &Order),
-) -> Ordering {
-    let (candidate_buy, candidate_sell) = candidate;
-    let (current_buy, current_sell) = current;
-
-    // Better bid, then better ask, then FIFO within each side's price level.
-    match current_buy.price.cmp(&candidate_buy.price) {
-        Ordering::Equal => {}
-        ordering => return ordering,
-    }
-
-    match candidate_sell.price.cmp(&current_sell.price) {
-        Ordering::Equal => {}
-        ordering => return ordering,
-    }
-
-    match candidate_buy.created_seq.cmp(&current_buy.created_seq) {
-        Ordering::Equal => {}
-        ordering => return ordering,
-    }
-
-    candidate_sell.created_seq.cmp(&current_sell.created_seq)
 }

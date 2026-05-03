@@ -1,5 +1,6 @@
 mod concurrency;
 mod outcome;
+mod requeue;
 
 use crate::AppState;
 use crate::engine::FillCandidate;
@@ -11,6 +12,7 @@ use outcome::{
     confirm_and_apply_settlement, prepare_fill_for_submit, process_fill, refresh_for_settlement,
     spawn_receipt_task, submit_settlement_once,
 };
+use requeue::claim_and_enqueue_available_fills;
 use std::env;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -294,14 +296,19 @@ fn spawn_concurrent_settlement_worker(args: SettlementWorkerArgs) {
     tokio::spawn(async move {
         let _worker_permit = args.worker_permit;
         let _inflight_permit = args.inflight_permit;
+        let precheck = {
+            let _user_guard = args
+                .user_locks
+                .lock_pair(args.fill.buyer, args.fill.seller)
+                .await;
+            precheck_fill_for_concurrent_submit(&args.state, &args.fill).await
+        };
+
+        let tx_turn = args.tx_gate.wait_for_turn(args.fill.seq).await;
         let _user_guard = args
             .user_locks
             .lock_pair(args.fill.buyer, args.fill.seller)
             .await;
-
-        let precheck = precheck_fill_for_concurrent_submit(&args.state, &args.fill).await;
-
-        let tx_turn = args.tx_gate.wait_for_turn(args.fill.seq).await;
         if args
             .reorder_state
             .invalidates(args.claim_generation, args.fill.seq)
@@ -315,6 +322,8 @@ fn spawn_concurrent_settlement_worker(args: SettlementWorkerArgs) {
             args.reorder_state.record_event(args.fill.seq);
             drop(tx_turn);
             args.apply_gate.complete(args.fill.seq);
+            drop(_user_guard);
+            claim_and_enqueue_available_fills(&args.state).await;
             return;
         }
         if finalize_concurrent_pre_submit(&args.state, &args.fill, precheck).await

@@ -45,6 +45,8 @@ pub(crate) struct StatsSnapshot {
     pub(crate) orders_rejected_stale_balance_cache_pct: f64,
     pub(crate) orders_failed_balance_refresh: u64,
     pub(crate) orders_failed_balance_refresh_pct: f64,
+    // Some fields below intentionally keep older dashboard aliases for the
+    // same counter. Do not remove them without a stats API version bump.
     pub(crate) orders_matched: u64,
     pub(crate) orders_with_successful_fill: u64,
     pub(crate) unique_orders_filled: u64,

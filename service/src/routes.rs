@@ -6,18 +6,20 @@ use crate::types::{
 };
 use alloy::primitives::Address;
 use axum::Json;
+use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use std::str::FromStr;
 
 pub(crate) async fn submit_order(
     State(state): State<AppState>,
-    Json(request): Json<SubmitOrderRequest>,
+    request: std::result::Result<Json<SubmitOrderRequest>, JsonRejection>,
 ) -> std::result::Result<Json<OrderResponse>, ApiError> {
+    let Json(request) = request.map_err(json_error)?;
     let ticket = state.admission.issue_ticket();
     let user = request.user;
 
-    let _turn = state.admission.wait_for_turn(ticket).await;
+    let _turn = ticket.wait_for_turn().await;
 
     let needs_refresh = {
         let engine = state.engine.lock().await;
@@ -49,8 +51,12 @@ pub(crate) async fn submit_order(
         let mut engine = state.engine.lock().await;
         engine.submit_order_and_claim_fills(request)?
     };
-    for fill in admission.fills {
+    for (index, fill) in admission.fills.iter().cloned().enumerate() {
         if state.settlement_queue.send(fill).is_err() {
+            let mut engine = state.engine.lock().await;
+            for unsent in &admission.fills[index..] {
+                engine.abort_fill(unsent, false, false);
+            }
             return Err(ApiError::Chain("settlement queue is closed".into()));
         }
     }
@@ -87,21 +93,42 @@ pub(crate) async fn get_balance(
 
 pub(crate) async fn list_orders(
     State(state): State<AppState>,
-    Query(query): Query<OrdersQuery>,
-) -> Json<Vec<OrderView>> {
+    query: std::result::Result<Query<OrdersQuery>, QueryRejection>,
+) -> std::result::Result<Json<Vec<OrderView>>, ApiError> {
+    let Query(query) = query.map_err(query_error)?;
     let engine = state.engine.lock().await;
-    Json(engine.open_orders(query.user))
+    Ok(Json(engine.open_orders(query.user)))
 }
 
 pub(crate) async fn get_book(
     State(state): State<AppState>,
-    Query(query): Query<BookQuery>,
-) -> Json<BookSnapshot> {
+    query: std::result::Result<Query<BookQuery>, QueryRejection>,
+) -> std::result::Result<Json<BookSnapshot>, ApiError> {
+    let Query(query) = query.map_err(query_error)?;
+    let depth = validated_depth(query)?;
     let engine = state.engine.lock().await;
-    Json(engine.book_snapshot(query.depth.unwrap_or(10)))
+    Ok(Json(engine.book_snapshot(depth)))
 }
 
 pub(crate) async fn get_stats(State(state): State<AppState>) -> Json<StatsSnapshot> {
     let engine = state.engine.lock().await;
     Json(engine.stats_snapshot())
+}
+
+fn validated_depth(query: BookQuery) -> std::result::Result<usize, ApiError> {
+    let depth = query.depth.unwrap_or(10);
+    if !(1..=100).contains(&depth) {
+        return Err(ApiError::BadRequest(
+            "book depth must be between 1 and 100".into(),
+        ));
+    }
+    Ok(depth)
+}
+
+fn json_error(err: JsonRejection) -> ApiError {
+    ApiError::BadRequest(format!("invalid JSON request: {err}"))
+}
+
+fn query_error(err: QueryRejection) -> ApiError {
+    ApiError::BadRequest(format!("invalid query string: {err}"))
 }

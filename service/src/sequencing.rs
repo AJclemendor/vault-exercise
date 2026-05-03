@@ -124,13 +124,37 @@ impl AdmissionSequencer {
         }
     }
 
-    pub(crate) fn issue_ticket(&self) -> u64 {
-        self.next_ticket.fetch_add(1, Ordering::Relaxed)
+    pub(crate) fn issue_ticket(&self) -> AdmissionTicket {
+        AdmissionTicket {
+            gate: self.gate.clone(),
+            ticket: self.next_ticket.fetch_add(1, Ordering::Relaxed),
+            skip_on_drop: true,
+        }
     }
+}
 
-    pub(crate) async fn wait_for_turn(&self, ticket: u64) -> AdmissionTurn {
-        AdmissionTurn {
-            _turn: self.gate.wait_for_turn(ticket).await,
+#[derive(Debug)]
+pub(crate) struct AdmissionTicket {
+    gate: OrderedGate,
+    ticket: u64,
+    skip_on_drop: bool,
+}
+
+impl AdmissionTicket {
+    pub(crate) async fn wait_for_turn(mut self) -> AdmissionTurn {
+        let turn = self.gate.wait_for_turn(self.ticket).await;
+        self.skip_on_drop = false;
+        AdmissionTurn { _turn: turn }
+    }
+}
+
+impl Drop for AdmissionTicket {
+    fn drop(&mut self) {
+        if self.skip_on_drop {
+            // HTTP clients can disconnect while queued behind older admissions.
+            // Completing the abandoned ticket keeps the ordered gate from
+            // wedging every later request behind work that will never run.
+            self.gate.complete(self.ticket);
         }
     }
 }

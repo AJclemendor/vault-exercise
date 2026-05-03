@@ -61,6 +61,8 @@ async fn main() -> Result<()> {
     )?;
     let (settlement_queue, settlement_rx) = mpsc::unbounded_channel();
     let state = AppState {
+        // This exercise service keeps its book in memory. Restart durability
+        // needs explicit order persistence and idempotency before production use.
         engine: Arc::new(Mutex::new(Engine::new())),
         chain,
         admission: Arc::new(AdmissionSequencer::new()),
