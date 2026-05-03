@@ -48,7 +48,7 @@ This summarizes the visible Rust service structure under `service/src`.
 | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `engine/`             | Core in-memory matching engine. It owns orders, book indexes, balance reservations, fill candidates, matching rules, and settlement state application.                                         |
 | `tasks/`              | Submodules for background task implementations. Currently this holds the settlement worker logic used by `tasks.rs`.                                                                           |
-| `chain.rs`            | Blockchain/RPC adapter. It reads token and vault balances, submits `matchOrders` transactions, confirms receipts, checks receipt status, and scans logs for users whose balances need refresh. |
+| `chain.rs`            | Blockchain/RPC adapter. It reads token and vault balances, submits `matchOrders` transactions, confirms receipts, checks receipt status, reads block hashes, and scans logs for users whose balances need refresh. |
 | `chain_tests.rs`      | Dedicated tests for chain log parsing, including indexed address topic decoding and dirty-user event aggregation.                                                                              |
 | `engine_tests.rs`     | Dedicated tests for engine behavior, including matching priority, balance reservation, stale order pruning, market order behavior, fill claiming, and stats accounting.                        |
 | `main.rs`             | Application entrypoint. It loads config, builds `ChainClient`, initializes shared `AppState`, starts background loops, and wires the Axum HTTP routes.                                         |
@@ -57,7 +57,7 @@ This summarizes the visible Rust service structure under `service/src`.
 | `sequencing_tests.rs` | Dedicated async tests for ordered gates and admission sequencing, including gap handling, idempotent completion, receipt apply ordering, and ticket-ordered order admission.                   |
 | `sequencing.rs`       | Ordering utilities. It provides `OrderedGate` and `AdmissionSequencer` so concurrent work can be admitted or applied in deterministic sequence order.                                          |
 | `stats.rs`            | Counter and snapshot definitions for service metrics, plus percentage and ratio helpers used by the engine and `/stats` endpoint.                                                              |
-| `tasks.rs`            | Background task entrypoints. It runs active balance refresh, chain log polling, periodic stats logging, and re-exports the settlement loop.                                                    |
+| `tasks.rs`            | Background task entrypoints. It runs active balance refresh, reorg-aware chain log polling, periodic stats logging, and re-exports the settlement loop.                                      |
 | `types.rs`            | Shared API and domain types, including order side/type/status, request and response DTOs, book snapshots, balance views, and API error responses.                                              |
 
 
@@ -84,8 +84,9 @@ This summarizes the visible Rust service structure under `service/src`.
 | -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
 | `tasks/settlement/mod.rs`              | Settlement loop coordinator. It selects sequential, receipt-concurrent, or fully concurrent settlement modes from environment config.           |
 | `tasks/settlement/outcome.rs`          | Settlement lifecycle handling. It prechecks fills, submits transactions, confirms receipts, applies success, and reconciles uncertain outcomes. |
+| `tasks/settlement/failure.rs`          | Shared settlement failure-policy helpers for send failures, receipt failures, and release-or-prune reverted fills.                             |
 | `tasks/settlement/concurrency.rs`      | Concurrency support for settlement workers, including user lock striping and reorder invalidation tracking.                                     |
-| `tasks/settlement/requeue.rs`          | Helper for claiming and enqueueing newly available fills after settlement outcomes release more matchable orders.                               |
+| `tasks/settlement/requeue.rs`          | Helper for claiming and enqueueing newly available fills after settlement outcomes release more matchable orders. It uses the configured claim batch size. |
 | `tasks/settlement/settlement_tests.rs` | Dedicated tests for settlement confirmation outcomes, uncertain receipts, unresolved fills, reverts, and send failures.                         |
 
 
@@ -128,6 +129,7 @@ sequenceDiagram
     participant B as Blockchain
 
     H->>R: POST /orders
+    R->>Q: ensure_settlement_queue_open()
     R->>S: issue_ticket()
 
     R->>E: balance_needs_admission_refresh(user)
@@ -235,17 +237,19 @@ This section describes how the engine decides whether a new order can enter the 
 
 For every order, the service uses a fresh-enough on-chain token balance, then checks the new order against the user's hard-available balance. Buy orders reserve `ceil(price * size / WAD)`, while sell orders reserve `size`. There is no separate close-position exception in the engine.
 
-Hard locks are intentionally narrower than total reservations. Market orders and in-flight fills count as hard locks. Resting limit orders increase `reserved`, but they are not fully hard-locked against future limit-order admission.
+The engine tracks reservations at two levels: the user's total reserved balance and each order's own `reserved` amount. Fill candidates carry the actual debit they would settle (`quote` for the buyer and `base` for the seller), and successful fills release reservation from the order and user based on that actual debit and the order's remaining size.
+
+Hard locks are intentionally narrower than total reservations. Market orders and in-flight fills count as hard locks using their actual in-flight debit. Resting limit orders increase `reserved`, but they are not fully hard-locked against future limit-order admission.
 
 ### Market Orders
 
-Market orders are admitted only if the full requested market-order reservation fits against current real balance minus hard locks. Once accepted, they cross immediately against available older resting limits. Any unmatched remainder is cancelled, while any matched in-flight amount stays hard-locked until settlement succeeds, fails, or is released.
+Market orders are admitted only if the full requested market-order reservation fits against current real balance minus hard locks. Once accepted, they cross immediately against available older resting limits. Any unmatched remainder is cancelled, while any matched in-flight amount stays hard-locked at the actual in-flight debit until settlement succeeds, fails, or is released.
 
 Because market orders create immediate settlement risk, accepting one can make older resting limit orders no longer fit the user's real balance. When that happens, the engine prunes eligible over-reserved sibling orders by marking them stale.
 
 ### Limit Orders
 
-Limit orders add their full notional or base requirement to `reserved` at placement, but resting limits are not hard-locked for later admission. This means a user with `$100` can place multiple individually affordable limits, such as ten `$90` orders, and become over-reserved.
+Limit orders add their full notional or base requirement to `reserved` at placement, but resting limits are not hard-locked for later admission. This means a user with `$100` can place multiple individually affordable limits, such as ten `$90` orders, and become over-reserved. When a limit order partially fills, its per-order reserved amount shrinks alongside the user's aggregate reservation.
 
 That overbooking is deliberate because it lets users express multiple resting intents with the same balance, supports laddered quotes across price levels, and makes the book deeper for matching and price discovery. The tradeoff is that not every visible resting order is guaranteed to remain fundable after other fills or balance changes. The service handles this by treating market orders and in-flight fills as hard locks, then pruning or staling live orders after balance refreshes, settlement success, and failed settlement paths when refreshed `reserved > real`.
 
@@ -302,13 +306,13 @@ The engine stores full order state in `orders: HashMap<String, Order>`. The publ
 
 `BTreeMap` keeps prices sorted, so bids can be walked from highest to lowest and asks from lowest to highest. Each price level stores order ids in a `VecDeque`, which preserves FIFO ordering within the same price level. Matching and snapshots lazily clean stale index entries, so the indexes may temporarily contain filled, cancelled, stale, or in-flight order ids, but only live and available limit orders are used.
 
-The current flow is: match synchronously, settle asynchronously. `POST /orders` refreshes admission balance if needed, waits for the admission ticket, submits the order through `submit_order_and_claim_fills(...)`, and immediately sends any generated `FillCandidate`s to the settlement queue. If the queue is closed, the route aborts all generated fills, cancels the just-submitted order, and returns a chain error. Settlement workers later refresh balances again, submit `Vault.matchOrders(...)`, confirm receipts, and apply success or abort/revert handling.
+The current flow is: match synchronously, settle asynchronously. `POST /orders` first checks that the settlement queue is open, refreshes admission balance if needed, waits for the admission ticket, submits the order through `submit_order_and_claim_fills(...)`, and immediately sends any generated `FillCandidate`s to the settlement queue. If the queue closes before or during admission handling, the route aborts any generated fills, cancels the just-submitted order when needed, and returns a chain error. Settlement workers later refresh balances again, submit `Vault.matchOrders(...)`, confirm receipts, and apply success or abort/revert handling.
 
 For market orders, `POST /orders` immediately walks the opposite book best-price-first and creates fill candidates against available older resting limits. Any unmatched remainder is cancelled before the response returns. Market orders never rest in the book and are hidden from `GET /orders` while their matched amount is waiting for settlement. If a market order matched, the engine keeps internal in-flight state so settlement success, revert, or abort can update reservations and fill state safely.
 
 For limit orders, `POST /orders` immediately crosses any marketable quantity against the opposite book before indexing the new order. After that, the order is inserted into the limit-order index. Public book depth only counts live, available limit liquidity from users without an in-flight order, so in-flight matched quantity is not exposed as resting depth.
 
-The engine also tracks in-flight fills by sequence. A stale fill candidate is ignored if the tracked candidate no longer exists or no longer matches the same buy order, sell order, and fill size. This prevents an older worker from mutating a released and re-claimed cross.
+The engine also tracks in-flight fills by sequence. A stale fill candidate is ignored if the tracked candidate no longer exists or no longer matches the same buy order, sell order, and fill size. This prevents an older worker from mutating a released and re-claimed cross. In fully concurrent mode, fill candidates also carry a claim generation; local abort/send-failure events advance the generation so later workers can invalidate older claims that were reordered around changed book state.
 
 The tradeoff is that settlement can still fail after off-chain matching because balances or allowances can change before `Vault.matchOrders(...)` executes, or because transaction send, receipt, revert, or unknown-outcome handling fails. That is why the service still needs pre-settlement refresh, dirty marking, stale orders, requeue handling, and revert/abort paths. Market-order behavior is still clean from the client perspective: matching and remainder cancellation happen immediately, while chain settlement remains asynchronous.
 
@@ -332,7 +336,7 @@ After broadcast, settlement has three main outcomes:
 
 The uncertain path is intentionally conservative. If later receipt checks prove success, the service applies the fill. If they prove revert, it handles the fill as a known failure. If the receipt remains unresolved after the deferred timeout, the service records an unknown outcome, marks both users dirty, stales both orders, aborts the fill, and releases reservations.
 
-We apply the release-or-prune policy for post-submit failures: a reverted fill can release cleanly or prune only the underfunded side after a successful refresh.
+The default `receipt_concurrent` mode uses the release-or-prune policy for post-submit failures. If the post-failure refresh is inconclusive, it releases the fill and requeues. If the refresh succeeds, it stales both sides when both still appear funded, or only the underfunded side when one side no longer supports the fill. The fully concurrent mode is stricter and stales both orders on post-submit failure because multiple worker outcomes can otherwise reorder around the same local book state.
 
 The reason for holding locks during uncertainty is accounting safety. Once a transaction hash exists, the service cannot assume failure just because receipt lookup is temporarily unavailable. Releasing funds too early could let another fill reuse the same balance while the original transaction later succeeds on-chain.
 
@@ -352,7 +356,7 @@ The service keeps balances fresh through three paths:
 
 - **Admission refresh:** refreshes the submitting user before order admission when their cache is stale, dirty, or missing.
 - **Active refresh loop:** only considers users with reserved balances, prioritizing dirty entries first and then the oldest stale entries. After a clean refresh, it prunes orders if the refreshed balance no longer supports the user's reservations.
-- **Log-based dirty marking:** polls token and vault logs. Transfers and matches mark both indexed users dirty; withdrawals mark the withdrawing user dirty.
+- **Log-based dirty marking:** polls token and vault logs. Transfers and matches mark both indexed users dirty; withdrawals mark the withdrawing user dirty. The poller also remembers the cursor block hash; if that hash changes, it treats the change as a reorg signal, marks all cached balances dirty, and rewinds by the configured reorg depth before continuing.
 
 Dirty marking is block-aware. A refresh only clears dirty state if it was read at or after the dirty event's block, which avoids trusting an older balance read after a newer chain event.
 
