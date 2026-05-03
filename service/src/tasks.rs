@@ -55,6 +55,7 @@ pub(crate) async fn log_poll_loop(state: AppState) {
             0
         }
     };
+    let mut last_seen_hash = block_hash_for_cursor(&state, last_seen).await;
 
     loop {
         tokio::time::sleep(tuning.log_poll_interval).await;
@@ -68,6 +69,26 @@ pub(crate) async fn log_poll_loop(state: AppState) {
 
         if latest == 0 {
             continue;
+        }
+
+        if let Some(expected_hash) = last_seen_hash.as_deref()
+            && last_seen <= latest
+        {
+            match state.chain.block_hash(last_seen).await {
+                Ok(Some(hash)) if hash == expected_hash => {}
+                Ok(_) => {
+                    eprintln!(
+                        "[logs] detected reorg at cursor block {last_seen}; dirtying cached balances"
+                    );
+                    let mut engine = state.engine.lock().await;
+                    engine.mark_all_balances_dirty();
+                    last_seen = latest.saturating_sub(tuning.log_reorg_depth).max(1);
+                }
+                Err(err) => {
+                    eprintln!("[logs] cursor block hash query failed block={last_seen}: {err:#}");
+                    continue;
+                }
+            }
         }
 
         // Re-read a small overlap on every poll. This makes cache invalidation
@@ -88,10 +109,24 @@ pub(crate) async fn log_poll_loop(state: AppState) {
                     }
                 }
                 last_seen = to;
+                last_seen_hash = block_hash_for_cursor(&state, to).await;
             }
             Err(err) => {
                 eprintln!("[logs] getLogs failed from={from} to={to}: {err:#}");
             }
+        }
+    }
+}
+
+async fn block_hash_for_cursor(state: &AppState, block: u64) -> Option<String> {
+    if block == 0 {
+        return None;
+    }
+    match state.chain.block_hash(block).await {
+        Ok(hash) => hash,
+        Err(err) => {
+            eprintln!("[logs] cursor block hash query failed block={block}: {err:#}");
+            None
         }
     }
 }

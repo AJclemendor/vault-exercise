@@ -40,3 +40,15 @@ fn dirty_log_collection_keeps_latest_block_per_user() {
     assert_eq!(users.get(&user), Some(&10));
     assert_eq!(users.get(&other), Some(&12));
 }
+
+#[test]
+fn block_hash_response_handles_null_and_normalizes_hash() {
+    assert_eq!(block_hash_from_response(&Value::Null).unwrap(), None);
+
+    let hash = block_hash_from_response(&json!({
+        "hash": "0xABCDEF"
+    }))
+    .unwrap();
+
+    assert_eq!(hash, Some("0xabcdef".into()));
+}

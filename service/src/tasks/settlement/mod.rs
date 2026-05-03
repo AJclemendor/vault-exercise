@@ -235,10 +235,10 @@ async fn concurrent_settlement_loop(
             break;
         };
         let mut fills = Vec::with_capacity(capacity);
-        fills.push((first_fill, reorder_state.generation()));
+        fills.push(first_fill);
         while fills.len() < capacity {
             match fill_rx.try_recv() {
-                Ok(fill) => fills.push((fill, reorder_state.generation())),
+                Ok(fill) => fills.push(fill),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => break,
             }
@@ -265,7 +265,7 @@ async fn concurrent_settlement_loop(
             );
         }
 
-        for (((fill, claim_generation), worker_permit), inflight_permit) in fills
+        for ((fill, worker_permit), inflight_permit) in fills
             .into_iter()
             .zip(worker_permits_for_batch)
             .zip(inflight_permits_for_batch)
@@ -278,7 +278,6 @@ async fn concurrent_settlement_loop(
                 receipt_permits: receipt_permits.clone(),
                 user_locks: user_locks.clone(),
                 reorder_state: reorder_state.clone(),
-                claim_generation,
                 worker_permit,
                 inflight_permit,
             });
@@ -294,7 +293,6 @@ struct SettlementWorkerArgs {
     receipt_permits: Arc<Semaphore>,
     user_locks: Arc<UserSettlementLocks>,
     reorder_state: Arc<PreSubmitReorderState>,
-    claim_generation: u64,
     worker_permit: OwnedSemaphorePermit,
     inflight_permit: OwnedSemaphorePermit,
 }
@@ -318,7 +316,7 @@ fn spawn_concurrent_settlement_worker(args: SettlementWorkerArgs) {
             .await;
         if args
             .reorder_state
-            .invalidates(args.claim_generation, args.fill.seq)
+            .invalidates(args.fill.claim_generation, args.fill.seq)
         {
             let mut engine = args.state.engine.lock().await;
             if precheck != ConcurrentPreSubmitCheck::NotPending {
@@ -326,7 +324,7 @@ fn spawn_concurrent_settlement_worker(args: SettlementWorkerArgs) {
             }
             engine.abort_fill(&args.fill, false, false);
             drop(engine);
-            args.reorder_state.record_event(args.fill.seq);
+            record_reorder_event(&args.state, &args.reorder_state, args.fill.seq).await;
             drop(tx_turn);
             args.apply_gate.complete(args.fill.seq);
             drop(_user_guard);
@@ -336,7 +334,7 @@ fn spawn_concurrent_settlement_worker(args: SettlementWorkerArgs) {
         if finalize_concurrent_pre_submit(&args.state, &args.fill, precheck).await
             == PreSubmitDecision::Abort
         {
-            args.reorder_state.record_event(args.fill.seq);
+            record_reorder_event(&args.state, &args.reorder_state, args.fill.seq).await;
             drop(tx_turn);
             args.apply_gate.complete(args.fill.seq);
             drop(_user_guard);
@@ -346,8 +344,8 @@ fn spawn_concurrent_settlement_worker(args: SettlementWorkerArgs) {
 
         match submit_settlement_once(&args.state, &args.fill).await {
             SubmitOutcome::SendFailed => {
+                record_reorder_event(&args.state, &args.reorder_state, args.fill.seq).await;
                 drop(tx_turn);
-                args.reorder_state.record_event(args.fill.seq);
                 args.apply_gate.complete(args.fill.seq);
                 claim_and_enqueue_available_fills(&args.state).await;
             }
@@ -371,6 +369,12 @@ fn spawn_concurrent_settlement_worker(args: SettlementWorkerArgs) {
             }
         }
     });
+}
+
+async fn record_reorder_event(state: &AppState, reorder_state: &PreSubmitReorderState, seq: u64) {
+    let generation = reorder_state.record_event(seq);
+    let mut engine = state.engine.lock().await;
+    engine.advance_fill_claim_generation(generation);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -436,6 +440,11 @@ async fn finalize_concurrent_pre_submit(
     let mut engine = state.engine.lock().await;
     if !engine.fill_still_pending(fill) {
         engine.record_settlement_aborted_before_tx();
+        return PreSubmitDecision::Abort;
+    }
+    if !engine.fill_balances_are_fresh(fill) {
+        engine.record_settlement_precheck_failed();
+        engine.abort_fill(fill, false, false);
         return PreSubmitDecision::Abort;
     }
     let (buyer_ok, seller_ok) = engine.prune_underfunded_fill_users(fill);

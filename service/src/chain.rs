@@ -209,6 +209,13 @@ impl ChainClient {
         )
     }
 
+    pub(crate) async fn block_hash(&self, block: u64) -> Result<Option<String>> {
+        let value = self
+            .rpc("eth_getBlockByNumber", json!([hex_block(block), false]))
+            .await?;
+        block_hash_from_response(&value)
+    }
+
     pub(crate) async fn dirty_users_from_logs(
         &self,
         from_block: u64,
@@ -398,6 +405,17 @@ fn parse_hex_u256(value: &str) -> Result<U256> {
         return Ok(U256::ZERO);
     }
     U256::from_str_radix(value, 16).context("failed to parse hex u256")
+}
+
+fn block_hash_from_response(value: &Value) -> Result<Option<String>> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let hash = value
+        .get("hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("block response did not include hash"))?;
+    Ok(Some(hash.to_ascii_lowercase()))
 }
 
 fn balance_of_call_data(user: Address) -> String {

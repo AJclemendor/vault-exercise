@@ -20,6 +20,8 @@ fn order(side: Side, price: u64, created_seq: u64) -> Order {
         order_type: OrderType::Limit,
         price: U256::from(price),
         size: U256::from(1u8),
+        reserved: math::reservation_for(side, U256::from(price), U256::from(1u8))
+            .expect("test order reservation should be bounded"),
         filled_size: U256::ZERO,
         in_flight_size: U256::ZERO,
         status: OrderStatus::Open,
@@ -111,15 +113,15 @@ fn log_events_already_covered_by_refresh_do_not_mark_cache_dirty() {
 }
 
 #[test]
-fn same_block_log_event_marks_cache_dirty_after_refresh() {
+fn same_block_log_event_covered_by_refresh_does_not_mark_cache_dirty() {
     let mut engine = Engine::new();
     let user = address(1);
 
     engine.apply_balance_refresh_at_block(user, wad(100), U256::ZERO, 12);
     engine.mark_dirty_at_block(user, 12);
 
-    assert!(engine.balance_view(user).stale);
-    assert_eq!(engine.stats.cache_dirty_events, 1);
+    assert!(!engine.balance_view(user).stale);
+    assert_eq!(engine.stats.cache_dirty_events, 0);
 
     engine.apply_balance_refresh_at_block(user, wad(90), U256::ZERO, 12);
 
@@ -685,6 +687,55 @@ fn precheck_allows_price_improved_fill_when_actual_debit_is_funded() {
     assert!(seller_ok);
     assert!(engine.fill_still_pending(&fill));
     assert_eq!(engine.orders[&buy_id].status, OrderStatus::Open);
+}
+
+#[test]
+fn precheck_uses_exact_debits_for_remaining_price_improved_fills() {
+    let mut engine = Engine::new();
+    let buyer = address(1);
+    let first_seller = address(2);
+    let second_seller = address(3);
+    engine.apply_balance_refresh(buyer, wad(20), U256::ZERO);
+    engine.apply_balance_refresh(first_seller, wad(5), U256::ZERO);
+    engine.apply_balance_refresh(second_seller, wad(5), U256::ZERO);
+
+    submit(
+        &mut engine,
+        first_seller,
+        Side::Sell,
+        OrderType::Limit,
+        tenth_wad(8),
+        wad(5),
+    );
+    submit(
+        &mut engine,
+        second_seller,
+        Side::Sell,
+        OrderType::Limit,
+        tenth_wad(8),
+        wad(5),
+    );
+    let admission = engine
+        .submit_order_and_claim_fills(SubmitOrderRequest {
+            user: buyer,
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            price: wad(1),
+            size: wad(10),
+        })
+        .expect("buyer order should match both resting asks");
+
+    assert_eq!(admission.fills.len(), 2);
+    assert_eq!(admission.fills[0].quote, wad(4));
+    assert_eq!(admission.fills[1].quote, wad(4));
+
+    engine.apply_balance_refresh(buyer, wad(8), U256::ZERO);
+    let (buyer_ok, seller_ok) = engine.prune_underfunded_fill_users(&admission.fills[0]);
+
+    assert!(buyer_ok);
+    assert!(seller_ok);
+    assert!(engine.fill_still_pending(&admission.fills[0]));
+    assert!(engine.fill_still_pending(&admission.fills[1]));
 }
 
 #[test]
@@ -1966,6 +2017,94 @@ fn buy_reservation_uses_aggregate_notional_for_wad_lots() {
 }
 
 #[test]
+fn split_buy_fills_cannot_claim_more_than_reserved_quote() {
+    let mut engine = Engine::new();
+    let buyer = address(1);
+    let first_seller = address(2);
+    let second_seller = address(3);
+    let half_wad = U256::from(WAD) / U256::from(2u8);
+    engine.apply_balance_refresh(buyer, U256::from(1u8), U256::ZERO);
+    engine.apply_balance_refresh(first_seller, U256::from(1u8), U256::ZERO);
+    engine.apply_balance_refresh(second_seller, U256::from(1u8), U256::ZERO);
+    submit(
+        &mut engine,
+        first_seller,
+        Side::Sell,
+        OrderType::Limit,
+        half_wad,
+        U256::from(1u8),
+    );
+    submit(
+        &mut engine,
+        second_seller,
+        Side::Sell,
+        OrderType::Limit,
+        half_wad,
+        U256::from(1u8),
+    );
+
+    let admission = engine
+        .submit_order_and_claim_fills(SubmitOrderRequest {
+            user: buyer,
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            price: half_wad,
+            size: U256::from(2u8),
+        })
+        .expect("buy should be accepted when aggregate notional is funded");
+    let quote_sum = admission
+        .fills
+        .iter()
+        .fold(U256::ZERO, |sum, fill| sum + fill.quote);
+
+    assert_eq!(admission.fills.len(), 1);
+    assert_eq!(quote_sum, U256::from(1u8));
+    assert_eq!(engine.balance_view(buyer).reserved, U256::from(1u8));
+}
+
+#[test]
+fn split_buy_fill_is_not_underpriced_when_rounding_reservation_is_exhausted() {
+    let mut engine = Engine::new();
+    let buyer = address(1);
+    let first_seller = address(2);
+    let second_seller = address(3);
+    let price = tenth_wad(6);
+    engine.apply_balance_refresh(buyer, U256::from(2u8), U256::ZERO);
+    engine.apply_balance_refresh(first_seller, U256::from(1u8), U256::ZERO);
+    engine.apply_balance_refresh(second_seller, U256::from(2u8), U256::ZERO);
+    submit(
+        &mut engine,
+        first_seller,
+        Side::Sell,
+        OrderType::Limit,
+        price,
+        U256::from(1u8),
+    );
+    submit(
+        &mut engine,
+        second_seller,
+        Side::Sell,
+        OrderType::Limit,
+        price,
+        U256::from(2u8),
+    );
+
+    let admission = engine
+        .submit_order_and_claim_fills(SubmitOrderRequest {
+            user: buyer,
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            price,
+            size: U256::from(3u8),
+        })
+        .expect("buy should be accepted when aggregate notional is funded");
+
+    assert_eq!(admission.fills.len(), 1);
+    assert_eq!(admission.fills[0].fill_size, U256::from(1u8));
+    assert_eq!(admission.fills[0].quote, U256::from(1u8));
+}
+
+#[test]
 fn market_buy_remainder_keeps_retained_quote_reserved() {
     let mut engine = Engine::new();
     let buyer = address(1);
@@ -1999,6 +2138,79 @@ fn market_buy_remainder_keeps_retained_quote_reserved() {
         engine.balance_view(buyer).reserved,
         admission.fills[0].quote
     );
+}
+
+#[test]
+fn market_buy_remainder_uses_price_improved_fill_quote() {
+    let mut engine = Engine::new();
+    let buyer = address(1);
+    let seller = address(2);
+    engine.apply_balance_refresh(buyer, wad(20), U256::ZERO);
+    engine.apply_balance_refresh(seller, wad(10), U256::ZERO);
+    submit(
+        &mut engine,
+        seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+
+    let admission = engine
+        .submit_order_and_claim_fills(SubmitOrderRequest {
+            user: buyer,
+            side: Side::Buy,
+            order_type: OrderType::Market,
+            price: wad(2),
+            size: wad(10),
+        })
+        .expect("market buy should be accepted");
+
+    assert_eq!(admission.fills.len(), 1);
+    assert_eq!(admission.fills[0].quote, wad(10));
+    assert_eq!(engine.balance_view(buyer).reserved, wad(10));
+}
+
+#[test]
+fn staling_price_improved_market_keeps_sibling_limit_reservation() {
+    let mut engine = Engine::new();
+    let buyer = address(1);
+    let seller = address(2);
+    engine.apply_balance_refresh(buyer, wad(40), U256::ZERO);
+    engine.apply_balance_refresh(seller, wad(10), U256::ZERO);
+    let sibling_limit = submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+    submit(
+        &mut engine,
+        seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(2),
+        wad(10),
+    );
+    let admission = engine
+        .submit_order_and_claim_fills(SubmitOrderRequest {
+            user: buyer,
+            side: Side::Buy,
+            order_type: OrderType::Market,
+            price: wad(3),
+            size: wad(10),
+        })
+        .expect("market buy should be accepted");
+
+    assert_eq!(admission.fills.len(), 1);
+    assert_eq!(engine.balance_view(buyer).reserved, wad(30));
+
+    engine.abort_fill(&admission.fills[0], true, false);
+
+    assert_eq!(engine.orders[&sibling_limit].status, OrderStatus::Open);
+    assert_eq!(engine.balance_view(buyer).reserved, wad(10));
 }
 
 #[test]

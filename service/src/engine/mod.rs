@@ -50,6 +50,7 @@ struct Order {
     order_type: OrderType,
     price: U256,
     size: U256,
+    reserved: U256,
     filled_size: U256,
     in_flight_size: U256,
     status: OrderStatus,
@@ -106,6 +107,7 @@ pub(crate) struct Engine {
     in_flight_orders_by_user: HashMap<Address, usize>,
     in_flight_fills: HashMap<u64, FillCandidate>,
     pending_fills: VecDeque<FillCandidate>,
+    fill_claim_generation: u64,
     next_order_seq: u64,
     next_fill_seq: u64,
     stats: Stats,
@@ -122,6 +124,7 @@ impl Engine {
             in_flight_orders_by_user: HashMap::new(),
             in_flight_fills: HashMap::new(),
             pending_fills: VecDeque::new(),
+            fill_claim_generation: 0,
             next_order_seq: 1,
             next_fill_seq: 1,
             stats: Stats::default(),
@@ -140,6 +143,7 @@ pub(crate) struct FillCandidate {
     pub(crate) exec_price: U256,
     pub(crate) quote: U256,
     pub(crate) base: U256,
+    pub(crate) claim_generation: u64,
 }
 
 pub(crate) struct OrderAdmission {

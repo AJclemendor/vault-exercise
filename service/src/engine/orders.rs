@@ -110,6 +110,7 @@ impl Engine {
             order_type: request.order_type,
             price: request.price,
             size: request.size,
+            reserved: required,
             filled_size: U256::ZERO,
             in_flight_size: U256::ZERO,
             status: OrderStatus::Open,
@@ -187,9 +188,7 @@ impl Engine {
                 self.abort_fill(fill, false, false);
             }
         }
-        if first_unsent == 0 {
-            let _ = self.cancel_order(order_id);
-        }
+        let _ = self.cancel_order(order_id);
     }
 
     pub(crate) fn open_orders(&self, user: Option<Address>) -> Vec<OrderView> {
@@ -213,14 +212,10 @@ impl Engine {
 
         self.release_related_in_flight_fills(order_id);
 
-        let release = reservation_for(
-            order_snapshot.side,
-            order_snapshot.price,
-            order_snapshot.total_remaining(),
-        )
-        .expect("stored order reservation should be bounded");
+        let release = order_snapshot.reserved;
 
         if let Some(order) = self.orders.get_mut(order_id) {
+            order.reserved = U256::ZERO;
             order.in_flight_size = U256::ZERO;
             order.status = status;
             order.cancel_requested = false;
@@ -353,19 +348,13 @@ impl Engine {
         }
 
         let retained_size = order_snapshot.filled_size + order_snapshot.in_flight_size;
-        let old_required = reservation_for(
-            order_snapshot.side,
-            order_snapshot.price,
-            order_snapshot.total_remaining(),
-        )
-        .expect("stored order reservation should be bounded");
-        let retained_required =
-            reservation_for(order_snapshot.side, order_snapshot.price, retained_size)
-                .expect("stored order reservation should be bounded");
+        let old_required = order_snapshot.reserved;
+        let retained_required = self.in_flight_debit_for_order(&order_snapshot);
         let release = sub_or_zero(old_required, retained_required);
 
         if let Some(order) = self.orders.get_mut(order_id) {
             order.size = retained_size;
+            order.reserved = retained_required;
             order.cancel_requested = true;
         }
         self.release_user_reservation(order_snapshot.user, release);

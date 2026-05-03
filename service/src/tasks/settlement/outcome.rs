@@ -67,6 +67,11 @@ pub(super) async fn prepare_fill_for_submit(
             engine.record_settlement_aborted_before_tx();
             return PreSubmitDecision::Abort;
         }
+        if !engine.fill_balances_are_fresh(fill) {
+            engine.record_settlement_precheck_failed();
+            engine.abort_fill(fill, false, false);
+            return PreSubmitDecision::Abort;
+        }
         let (buyer_ok, seller_ok) = engine.prune_underfunded_fill_users(fill);
         if !buyer_ok || !seller_ok {
             engine.record_settlement_precheck_failed();
@@ -89,23 +94,22 @@ pub(super) async fn submit_settlement_once(
         .await
     {
         Ok(pending) => SubmitOutcome::Submitted(pending),
-        Err(err) => match settlement_send_failure_action() {
-            SettlementFailureAction::AbortKnownFailure => {
-                eprintln!(
-                    "[settlement] matchOrders send failed; releasing fill seq={} buy={} sell={} quote={} base={}: {err:#}",
-                    fill.seq, fill.buyer, fill.seller, fill.quote, fill.base
-                );
-                let mut engine = state.engine.lock().await;
-                engine.record_settlement_send_failed();
-                engine.mark_dirty(fill.buyer);
-                engine.mark_dirty(fill.seller);
-                engine.abort_fill(fill, true, true);
-                SubmitOutcome::SendFailed
-            }
-            SettlementFailureAction::HoldUncertainOutcome => {
-                unreachable!("send failures cannot be held without a transaction hash")
-            }
-        },
+        Err(err) => {
+            debug_assert_eq!(
+                settlement_send_failure_action(),
+                SettlementFailureAction::AbortKnownFailure
+            );
+            eprintln!(
+                "[settlement] matchOrders send failed before tx hash; staling fill seq={} buy={} sell={} quote={} base={}: {err:#}",
+                fill.seq, fill.buyer, fill.seller, fill.quote, fill.base
+            );
+            let mut engine = state.engine.lock().await;
+            engine.record_settlement_send_failed();
+            engine.mark_dirty(fill.buyer);
+            engine.mark_dirty(fill.seller);
+            engine.abort_fill(fill, true, true);
+            SubmitOutcome::SendFailed
+        }
     }
 }
 

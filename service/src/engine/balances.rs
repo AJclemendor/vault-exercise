@@ -129,13 +129,20 @@ impl Engine {
         }
     }
 
+    pub(crate) fn mark_all_balances_dirty(&mut self) {
+        let users: Vec<_> = self.balances.keys().copied().collect();
+        for user in users {
+            self.mark_dirty(user);
+        }
+    }
+
     pub(crate) fn mark_dirty_at_block(&mut self, user: Address, block: u64) {
         let Some(balance) = self.balances.get_mut(&user) else {
             return;
         };
         if balance
             .last_refresh_block
-            .map(|last_block| block < last_block)
+            .map(|last_block| block <= last_block)
             .unwrap_or(false)
         {
             return;

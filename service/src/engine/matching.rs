@@ -2,7 +2,7 @@ use alloy::primitives::{Address, U256};
 
 use crate::types::{OrderStatus, OrderType, Side};
 
-use super::math::{min_u256, reservation_for, sub_or_zero};
+use super::math::{min_u256, sub_or_zero};
 use super::{Engine, FillCandidate, Order};
 
 impl Engine {
@@ -228,7 +228,7 @@ impl Engine {
         }
 
         let exec_price = execution_price(buy, sell);
-        let quote = reservation_for(Side::Buy, exec_price, fill_size)?;
+        let quote = self.quote_for_buy_fill(buy, exec_price, fill_size)?;
         if quote.is_zero() {
             return None;
         }
@@ -246,6 +246,7 @@ impl Engine {
             exec_price,
             quote,
             base: fill_size,
+            claim_generation: self.fill_claim_generation,
         };
 
         self.add_order_in_flight(&buy_id, fill_size);
@@ -371,8 +372,8 @@ impl Engine {
         }
         self.untrack_in_flight_fill(fill.seq);
 
-        let matched_orders = self.apply_order_fill(&fill.buy_id, fill.fill_size) as u64
-            + self.apply_order_fill(&fill.sell_id, fill.fill_size) as u64;
+        let matched_orders = self.apply_order_fill(&fill.buy_id, fill.fill_size, fill.quote) as u64
+            + self.apply_order_fill(&fill.sell_id, fill.fill_size, fill.base) as u64;
 
         if prune_balances {
             self.stale_over_reserved_orders_for_user(fill.buyer, None);
@@ -386,20 +387,21 @@ impl Engine {
         self.stats.successful_settlements += 1;
     }
 
-    fn apply_order_fill(&mut self, order_id: &str, fill_size: U256) -> bool {
+    fn apply_order_fill(
+        &mut self,
+        order_id: &str,
+        fill_size: U256,
+        settlement_debit: U256,
+    ) -> bool {
         let Some(order_snapshot) = self.orders.get(order_id).cloned() else {
             return false;
         };
-        let old_required = reservation_for(
-            order_snapshot.side,
-            order_snapshot.price,
-            order_snapshot.total_remaining(),
-        )
-        .expect("stored order reservation should be bounded");
+        let release_after_fill = self
+            .release_after_order_fill(&order_snapshot, fill_size, settlement_debit)
+            .expect("stored order reservation should be bounded");
 
         let mut cancel_after_fill = false;
         let mut terminal_filled = false;
-        let release_after_fill: U256;
         let user;
         let first_successful_fill;
         let in_flight_transition;
@@ -426,14 +428,7 @@ impl Engine {
             }
             let is_in_flight = order.is_live() && order.in_flight_size > U256::ZERO;
             in_flight_transition = (user, was_in_flight, is_in_flight);
-
-            let new_required = if order.is_live() {
-                reservation_for(order.side, order.price, order.total_remaining())
-                    .expect("stored order reservation should be bounded")
-            } else {
-                U256::ZERO
-            };
-            release_after_fill = sub_or_zero(old_required, new_required);
+            order.reserved = sub_or_zero(order.reserved, release_after_fill);
         }
 
         self.apply_in_flight_transition(in_flight_transition);

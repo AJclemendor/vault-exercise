@@ -1,40 +1,80 @@
 use alloy::primitives::Address;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
+const MAX_REORDER_EVENTS: usize = 1024;
+
 #[derive(Debug)]
 pub(super) struct PreSubmitReorderState {
     generation: AtomicU64,
-    events: std::sync::Mutex<Vec<(u64, u64)>>,
+    events: std::sync::Mutex<ReorderEvents>,
+}
+
+#[derive(Debug, Default)]
+struct ReorderEvents {
+    retained: VecDeque<(u64, u64)>,
+    pruned_min_seq: Option<u64>,
+    pruned_through_generation: u64,
 }
 
 impl PreSubmitReorderState {
     pub(super) fn new() -> Self {
         Self {
             generation: AtomicU64::new(0),
-            events: std::sync::Mutex::new(Vec::new()),
+            events: std::sync::Mutex::new(ReorderEvents::default()),
         }
     }
 
-    pub(super) fn generation(&self) -> u64 {
-        self.generation.load(Ordering::SeqCst)
-    }
-
-    pub(super) fn record_event(&self, seq: u64) {
+    pub(super) fn record_event(&self, seq: u64) -> u64 {
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        self.events
+        let mut events = self
+            .events
             .lock()
-            .expect("pre-submit reorder state poisoned")
-            .push((generation, seq));
+            .expect("pre-submit reorder state poisoned");
+        events.retained.push_back((generation, seq));
+        while events.retained.len() > MAX_REORDER_EVENTS {
+            let Some((pruned_generation, pruned_seq)) = events.retained.pop_front() else {
+                break;
+            };
+            events.pruned_through_generation = pruned_generation;
+            events.pruned_min_seq = Some(
+                events
+                    .pruned_min_seq
+                    .map(|current| current.min(pruned_seq))
+                    .unwrap_or(pruned_seq),
+            );
+        }
+        generation
     }
 
     pub(super) fn invalidates(&self, claim_generation: u64, fill_seq: u64) -> bool {
+        let events = self
+            .events
+            .lock()
+            .expect("pre-submit reorder state poisoned");
+        if claim_generation < events.pruned_through_generation
+            && events
+                .pruned_min_seq
+                .map(|seq| seq < fill_seq)
+                .unwrap_or(false)
+        {
+            return true;
+        }
+        events
+            .retained
+            .iter()
+            .any(|(generation, seq)| *generation > claim_generation && *seq < fill_seq)
+    }
+
+    #[cfg(test)]
+    pub(super) fn retained_event_count(&self) -> usize {
         self.events
             .lock()
             .expect("pre-submit reorder state poisoned")
-            .iter()
-            .any(|(generation, seq)| *generation > claim_generation && *seq < fill_seq)
+            .retained
+            .len()
     }
 }
 

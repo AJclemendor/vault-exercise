@@ -22,6 +22,7 @@ pub(crate) async fn submit_order(
         engine.record_order_shape_rejection();
         return Err(err);
     }
+    ensure_settlement_queue_open(&state)?;
 
     let ticket = state.admission.issue_ticket();
     let user = request.user;
@@ -37,17 +38,26 @@ pub(crate) async fn submit_order(
         engine.submit_order_and_claim_fills(request)?
     };
     let order_id = admission.response.order_id.clone();
+    if admission.fills.is_empty() && state.settlement_queue.is_closed() {
+        let mut engine = state.engine.lock().await;
+        let _ = engine.cancel_order(&order_id);
+        return Err(ApiError::Chain("settlement queue is closed".into()));
+    }
     for (index, fill) in admission.fills.iter().cloned().enumerate() {
         if state.settlement_queue.send(fill).is_err() {
             let mut engine = state.engine.lock().await;
             engine.abort_admission_after_queue_failure(&order_id, &admission.fills, index);
-            if index == 0 {
-                return Err(ApiError::Chain("settlement queue is closed".into()));
-            }
-            return Ok(Json(admission.response));
+            return Err(ApiError::Chain("settlement queue is closed".into()));
         }
     }
     Ok(Json(admission.response))
+}
+
+fn ensure_settlement_queue_open(state: &AppState) -> std::result::Result<(), ApiError> {
+    if state.settlement_queue.is_closed() {
+        return Err(ApiError::Chain("settlement queue is closed".into()));
+    }
+    Ok(())
 }
 
 async fn refresh_admission_balance_if_needed(

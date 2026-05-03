@@ -104,25 +104,32 @@ async fn admission_sequencer_commits_in_ticket_order() {
     let sequencer = Arc::new(AdmissionSequencer::new());
     let committed = Arc::new(Mutex::new(Vec::new()));
     let (ready_tx, mut ready_rx) = mpsc::unbounded_channel();
+    let mut handles = Vec::new();
 
     for label in ["slow-first", "fast-second"] {
         let ticket = sequencer.issue_ticket();
         let committed = committed.clone();
         let ready_tx = ready_tx.clone();
-        tokio::spawn(async move {
+        handles.push(tokio::spawn(async move {
             ready_tx.send(label).expect("receiver should be alive");
             if label == "slow-first" {
                 tokio::time::sleep(Duration::from_millis(30)).await;
             }
             let _turn = ticket.wait_for_turn().await;
             committed.lock().await.push(label);
-        });
+        }));
     }
     drop(ready_tx);
 
-    assert_eq!(ready_rx.recv().await, Some("slow-first"));
-    assert_eq!(ready_rx.recv().await, Some("fast-second"));
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    let mut ready = vec![
+        ready_rx.recv().await.expect("first task should start"),
+        ready_rx.recv().await.expect("second task should start"),
+    ];
+    ready.sort();
+    assert_eq!(ready, vec!["fast-second", "slow-first"]);
+    for handle in handles {
+        handle.await.expect("sequenced task should complete");
+    }
 
     assert_eq!(
         committed.lock().await.as_slice(),

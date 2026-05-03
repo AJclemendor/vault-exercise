@@ -28,7 +28,7 @@ fn test_chain_client() -> ChainClient {
 }
 
 #[tokio::test]
-async fn queue_send_failure_cancels_submitted_order() {
+async fn closed_queue_rejects_crossing_order_without_mutating_taker() {
     let buyer = address(1);
     let seller = address(2);
     let mut engine = Engine::new();
@@ -70,9 +70,41 @@ async fn queue_send_failure_cancels_submitted_order() {
     assert!(engine.open_orders(Some(buyer)).is_empty());
     assert_eq!(engine.open_orders(Some(seller)).len(), 1);
     let snapshot = engine.stats_snapshot();
-    assert_eq!(snapshot.fill_candidates, 1);
-    assert_eq!(snapshot.settlements_aborted_before_tx, 1);
+    assert_eq!(snapshot.fill_candidates, 0);
+    assert_eq!(snapshot.settlements_aborted_before_tx, 0);
     assert_eq!(snapshot.settlement_pending_outcomes, 0);
+}
+
+#[tokio::test]
+async fn closed_queue_rejects_resting_order_without_mutating_book() {
+    let seller = address(2);
+    let mut engine = Engine::new();
+    engine.apply_balance_refresh(seller, wad(10), U256::ZERO);
+
+    let (settlement_queue, settlement_rx) = mpsc::unbounded_channel();
+    drop(settlement_rx);
+    let state = crate::AppState {
+        engine: Arc::new(Mutex::new(engine)),
+        chain: test_chain_client(),
+        admission: Arc::new(AdmissionSequencer::new()),
+        settlement_queue,
+    };
+
+    let result = submit_order(
+        State(state.clone()),
+        Ok(Json(SubmitOrderRequest {
+            user: seller,
+            side: Side::Sell,
+            order_type: OrderType::Limit,
+            price: wad(1),
+            size: wad(1),
+        })),
+    )
+    .await;
+
+    assert!(matches!(result, Err(ApiError::Chain(_))));
+    let engine = state.engine.lock().await;
+    assert!(engine.open_orders(Some(seller)).is_empty());
 }
 
 #[tokio::test]
@@ -105,7 +137,7 @@ async fn invalid_order_is_rejected_before_balance_refresh() {
 }
 
 #[test]
-fn partial_queue_failure_only_aborts_unsent_fills() {
+fn queue_failure_aborts_only_unsent_admission_fills() {
     let buyer = address(1);
     let first_seller = address(2);
     let second_seller = address(3);

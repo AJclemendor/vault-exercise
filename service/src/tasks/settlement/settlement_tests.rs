@@ -168,11 +168,63 @@ fn confirmation_reverts_are_known_failures() {
 }
 
 #[test]
-fn send_failures_abort_fill_state_without_tx_hash() {
+fn send_failures_abort_state_without_tx_hash() {
     assert_eq!(
         settlement_send_failure_action(),
         SettlementFailureAction::AbortKnownFailure
     );
+}
+
+#[tokio::test]
+async fn send_failure_aborts_fill_without_tx_hash() {
+    let buyer = address(1);
+    let seller = address(2);
+    let mut engine = Engine::new();
+    engine.apply_balance_refresh(buyer, wad(20), U256::ZERO);
+    engine.apply_balance_refresh(seller, wad(10), U256::ZERO);
+    submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+    submit(
+        &mut engine,
+        seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+    let fill = engine.next_fill_candidate().expect("orders should cross");
+
+    let (settlement_queue, _settlement_rx) = mpsc::unbounded_channel();
+    let state = AppState {
+        engine: Arc::new(Mutex::new(engine)),
+        chain: test_chain_client_with_rpc("http://127.0.0.1:1"),
+        admission: Arc::new(AdmissionSequencer::new()),
+        settlement_queue,
+    };
+
+    assert!(matches!(
+        submit_settlement_once(&state, &fill).await,
+        SubmitOutcome::SendFailed
+    ));
+
+    let engine = state.engine.lock().await;
+    assert!(!engine.fill_still_pending(&fill));
+    assert!(engine.open_orders(Some(buyer)).is_empty());
+    assert!(engine.open_orders(Some(seller)).is_empty());
+    assert_eq!(engine.balance_view(buyer).reserved, U256::ZERO);
+    assert_eq!(engine.balance_view(seller).reserved, U256::ZERO);
+    assert!(engine.balance_view(buyer).stale);
+    assert!(engine.balance_view(seller).stale);
+    let snapshot = engine.stats_snapshot();
+    assert_eq!(snapshot.settlement_send_failures, 1);
+    assert_eq!(snapshot.settlement_pending_outcomes, 0);
+    assert_eq!(snapshot.orders_marked_stale, 2);
 }
 
 #[test]
@@ -212,10 +264,66 @@ fn funded_revert_release_policy_stales_both_orders() {
 fn reorder_generation_after_prior_event_does_not_invalidate_fresh_fill() {
     let reorder_state = super::super::concurrency::PreSubmitReorderState::new();
 
-    reorder_state.record_event(1);
-    let generation_after_event = reorder_state.generation();
+    let generation_after_event = reorder_state.record_event(1);
 
     assert!(!reorder_state.invalidates(generation_after_event, 2));
+}
+
+#[test]
+fn reorder_state_prunes_retained_events_without_missing_old_invalidations() {
+    let reorder_state = super::super::concurrency::PreSubmitReorderState::new();
+    let mut first_generation = 0;
+    for seq in 1..=1100 {
+        let generation = reorder_state.record_event(seq);
+        if seq == 1 {
+            first_generation = generation;
+        }
+    }
+
+    assert!(reorder_state.retained_event_count() <= 1024);
+    assert!(reorder_state.invalidates(first_generation - 1, 1101));
+    assert!(!reorder_state.invalidates(1100, 1101));
+}
+
+#[test]
+fn fill_claim_generation_advances_after_reorder_event() {
+    let buyer = address(1);
+    let seller = address(2);
+    let mut engine = Engine::new();
+    engine.apply_balance_refresh(buyer, wad(20), U256::ZERO);
+    engine.apply_balance_refresh(seller, wad(20), U256::ZERO);
+    submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+    submit(
+        &mut engine,
+        seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+
+    let first = engine
+        .claim_next_fill_candidate()
+        .expect("orders should cross");
+    assert_eq!(first.claim_generation, 0);
+
+    let reorder_state = super::super::concurrency::PreSubmitReorderState::new();
+    let generation = reorder_state.record_event(first.seq);
+    engine.advance_fill_claim_generation(generation);
+    engine.abort_fill(&first, false, false);
+    let second = engine
+        .claim_next_fill_candidate()
+        .expect("orders should re-cross");
+
+    assert_eq!(second.claim_generation, generation);
+    assert!(!reorder_state.invalidates(second.claim_generation, second.seq));
 }
 
 #[test]
@@ -229,6 +337,16 @@ fn settlement_mode_config_reads_mode_source() {
         super::super::SettlementConfig::from_sources(Some("sequential"), |_, default| default);
     assert_eq!(sequential.mode, super::super::SettlementMode::Sequential);
     assert_eq!(sequential.concurrency, 1);
+
+    let capped =
+        super::super::SettlementConfig::from_sources(Some("concurrent"), |name, default| {
+            if name == "MAX_FILL_CLAIM_BATCH" {
+                2
+            } else {
+                default
+            }
+        });
+    assert_eq!(capped.max_fill_claim_batch, 2);
 }
 
 #[tokio::test]
@@ -249,6 +367,62 @@ async fn user_settlement_lock_blocks_sibling_receipt_work() {
     assert!(timeout(Duration::from_millis(25), rx.recv()).await.is_err());
     drop(first_guard);
     assert_eq!(rx.recv().await, Some(()));
+}
+
+#[tokio::test]
+async fn dirty_cache_during_concurrent_final_check_releases_without_staling() {
+    let buyer = address(1);
+    let seller = address(2);
+    let mut engine = Engine::new();
+    engine.apply_balance_refresh(buyer, wad(20), U256::ZERO);
+    engine.apply_balance_refresh(seller, wad(10), U256::ZERO);
+    submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+    submit(
+        &mut engine,
+        seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+    let fill = engine.next_fill_candidate().expect("orders should cross");
+    engine.mark_dirty(buyer);
+
+    let (settlement_queue, _settlement_rx) = mpsc::unbounded_channel();
+    let state = AppState {
+        engine: Arc::new(Mutex::new(engine)),
+        chain: test_chain_client(),
+        admission: Arc::new(AdmissionSequencer::new()),
+        settlement_queue,
+    };
+
+    assert_eq!(
+        super::super::finalize_concurrent_pre_submit(
+            &state,
+            &fill,
+            super::super::ConcurrentPreSubmitCheck::Ready
+        )
+        .await,
+        PreSubmitDecision::Abort
+    );
+
+    let engine = state.engine.lock().await;
+    assert!(!engine.fill_still_pending(&fill));
+    assert_eq!(engine.open_orders(Some(buyer))[0].status, OrderStatus::Open);
+    assert_eq!(
+        engine.open_orders(Some(seller))[0].status,
+        OrderStatus::Open
+    );
+    let snapshot = engine.stats_snapshot();
+    assert_eq!(snapshot.settlements_precheck_failed, 1);
+    assert_eq!(snapshot.orders_marked_stale, 0);
 }
 
 #[tokio::test]
@@ -293,6 +467,46 @@ async fn released_crossed_orders_are_requeued_for_settlement() {
 
     assert_eq!(requeued.buy_id, buy_id);
     assert_eq!(requeued.sell_id, sell_id);
+}
+
+#[tokio::test]
+async fn requeue_claims_no_more_than_configured_limit() {
+    let mut engine = Engine::new();
+    for byte in 1..=3 {
+        let buyer = address(byte);
+        let seller = address(byte + 10);
+        engine.apply_balance_refresh(buyer, wad(10), U256::ZERO);
+        engine.apply_balance_refresh(seller, wad(10), U256::ZERO);
+        submit(
+            &mut engine,
+            buyer,
+            Side::Buy,
+            OrderType::Limit,
+            wad(1),
+            wad(1),
+        );
+        submit(
+            &mut engine,
+            seller,
+            Side::Sell,
+            OrderType::Limit,
+            wad(1),
+            wad(1),
+        );
+    }
+
+    let (settlement_queue, mut settlement_rx) = mpsc::unbounded_channel();
+    let state = AppState {
+        engine: Arc::new(Mutex::new(engine)),
+        chain: test_chain_client(),
+        admission: Arc::new(AdmissionSequencer::new()),
+        settlement_queue,
+    };
+
+    super::super::requeue::claim_and_enqueue_available_fills_with_limit(&state, 1).await;
+
+    assert!(settlement_rx.recv().await.is_some());
+    assert!(settlement_rx.try_recv().is_err());
 }
 
 #[tokio::test]

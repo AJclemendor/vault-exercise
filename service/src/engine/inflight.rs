@@ -14,6 +14,10 @@ impl Engine {
         self.in_flight_fills.remove(&seq);
     }
 
+    pub(crate) fn advance_fill_claim_generation(&mut self, generation: u64) {
+        self.fill_claim_generation = self.fill_claim_generation.max(generation);
+    }
+
     pub(super) fn pop_pending_fill(&mut self) -> Option<FillCandidate> {
         while let Some(fill) = self.pending_fills.pop_front() {
             if self.fill_still_pending(&fill) {

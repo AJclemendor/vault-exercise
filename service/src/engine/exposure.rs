@@ -1,6 +1,6 @@
 use alloy::primitives::{Address, U256};
 
-use crate::types::{OrderStatus, OrderType};
+use crate::types::{OrderStatus, OrderType, Side};
 
 use super::math::{reservation_for, sub_or_zero};
 use super::{Engine, Order};
@@ -84,7 +84,7 @@ impl Engine {
         settlement_debit: U256,
     ) -> Option<U256> {
         self.hard_locked_for_user_excluding_order(user, &order.id)
-            .checked_add(hard_locked_after_fill(order, fill_size)?)?
+            .checked_add(self.hard_locked_after_fill(order, fill_size, settlement_debit)?)?
             .checked_add(settlement_debit)
     }
 
@@ -93,7 +93,7 @@ impl Engine {
             .iter()
             .filter_map(|order_id| self.orders.get(order_id))
             .fold(U256::ZERO, |total, order| {
-                total + hard_locked_for_order(order)
+                total + self.hard_locked_for_order(order)
             })
     }
 
@@ -103,37 +103,112 @@ impl Engine {
             .filter(|id| id.as_str() != order_id)
             .filter_map(|id| self.orders.get(id))
             .fold(U256::ZERO, |total, order| {
-                total + hard_locked_for_order(order)
+                total + self.hard_locked_for_order(order)
             })
+    }
+
+    pub(super) fn in_flight_debit_for_order(&self, order: &Order) -> U256 {
+        let mut found = false;
+        let mut total = U256::ZERO;
+
+        for fill in self.in_flight_fills.values() {
+            let debit = if fill.buy_id == order.id {
+                fill.quote
+            } else if fill.sell_id == order.id {
+                fill.base
+            } else {
+                continue;
+            };
+            found = true;
+            total = total.checked_add(debit).unwrap_or(U256::MAX);
+        }
+
+        if found {
+            total
+        } else {
+            reservation_for(order.side, order.price, order.in_flight_size)
+                .expect("stored order reservation should be bounded")
+        }
+    }
+
+    pub(super) fn quote_for_buy_fill(
+        &self,
+        buy: &Order,
+        exec_price: U256,
+        fill_size: U256,
+    ) -> Option<U256> {
+        let requested = reservation_for(Side::Buy, exec_price, fill_size)?;
+        let already_claimed = self.in_flight_debit_for_order(buy);
+        let remaining_reserved = sub_or_zero(buy.reserved, already_claimed);
+        if remaining_reserved < requested {
+            return None;
+        }
+        Some(requested)
+    }
+
+    pub(super) fn release_after_order_fill(
+        &self,
+        order: &Order,
+        fill_size: U256,
+        settlement_debit: U256,
+    ) -> Option<U256> {
+        if order.total_remaining() < fill_size {
+            return None;
+        }
+        if order.order_type == OrderType::Market {
+            return Some(settlement_debit);
+        }
+
+        let post_fill_remaining = order.total_remaining() - fill_size;
+        let new_required = if post_fill_remaining.is_zero() {
+            U256::ZERO
+        } else {
+            reservation_for(order.side, order.price, post_fill_remaining)?
+        };
+        Some(sub_or_zero(order.reserved, new_required))
+    }
+
+    fn hard_locked_for_order(&self, order: &Order) -> U256 {
+        match order.order_type {
+            OrderType::Market if order.in_flight_size > U256::ZERO => {
+                self.in_flight_debit_for_order(order)
+            }
+            OrderType::Market => gross_required_for_order(order),
+            OrderType::Limit if order.in_flight_size > U256::ZERO => {
+                self.in_flight_debit_for_order(order)
+            }
+            OrderType::Limit => U256::ZERO,
+        }
+    }
+
+    fn hard_locked_after_fill(
+        &self,
+        order: &Order,
+        fill_size: U256,
+        settlement_debit: U256,
+    ) -> Option<U256> {
+        if order.total_remaining() < fill_size || order.in_flight_size < fill_size {
+            return None;
+        }
+
+        if order.in_flight_size > U256::ZERO {
+            return Some(sub_or_zero(
+                self.in_flight_debit_for_order(order),
+                settlement_debit,
+            ));
+        }
+
+        let post_fill_remaining = order.total_remaining() - fill_size;
+        if order.order_type == OrderType::Market {
+            return reservation_for(order.side, order.price, post_fill_remaining);
+        }
+
+        let post_fill_in_flight = order.in_flight_size - fill_size;
+        reservation_for(order.side, order.price, post_fill_in_flight)
     }
 }
 
 fn gross_required_for_order(order: &Order) -> U256 {
     reservation_for(order.side, order.price, order.total_remaining())
         .expect("stored order reservation should be bounded")
-}
-
-fn hard_locked_for_order(order: &Order) -> U256 {
-    match order.order_type {
-        OrderType::Market => gross_required_for_order(order),
-        OrderType::Limit if order.in_flight_size > U256::ZERO => {
-            reservation_for(order.side, order.price, order.in_flight_size)
-                .expect("stored order reservation should be bounded")
-        }
-        OrderType::Limit => U256::ZERO,
-    }
-}
-
-fn hard_locked_after_fill(order: &Order, fill_size: U256) -> Option<U256> {
-    if order.total_remaining() < fill_size || order.in_flight_size < fill_size {
-        return None;
-    }
-
-    let post_fill_remaining = order.total_remaining() - fill_size;
-    if order.order_type == OrderType::Market {
-        return reservation_for(order.side, order.price, post_fill_remaining);
-    }
-
-    let post_fill_in_flight = order.in_flight_size - fill_size;
-    reservation_for(order.side, order.price, post_fill_in_flight)
 }
