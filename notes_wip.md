@@ -6,31 +6,31 @@ I used codex for formatting // spell check for this writeup but all initial vers
 Small note as I am not very familiar with Rust: I made a point to keep non-test files under `service/src` below 500 lines. This added some complexity in a few places where I think longer files (Particularly in the engine part) would have been easier, if I had to do it over I would take this into consideration and be a little more lenient with the file size.
 
 Also, my eyesight is lowkey dying, so I tend to log some things with color and formatting because it makes runtime output easier for me to scan.
-# 2. Repo Run Stats Comparison (50k order run)
+# 2. Repo Run Stats (50k order run)
 
-| Metric | First run | Last run |
-|---|---:|---:|
-| Orders received | 844 | 50,556 |
-| Orders accepted | 659 / 844 (78.1%) | 38,372 / 50,556 (75.9%) |
-| Orders rejected | 185 / 844 (21.9%) | 12,184 / 50,556 (24.1%) |
-| Admission failures | 185 | 12,184 |
-| Insufficient balance rejects | 185 | 12,181 |
-| Stale cache rejects | 0 | 3 |
-| Orders matched | 336 / 659 (51.0%) | 18,150 / 38,372 (47.3%) |
-| Fill side events | 590 | 35,142 |
-| Settlements attempted | 303 / 303 (100.0%) | 17,674 / 17,681 (100.0%) |
-| Precheck passed | 303 / 303 (100.0%) | 17,674 / 17,674 (100.0%) |
-| Settlements reverted | 0 (0.0%) | 18 (0.1%) |
-| Settlement success | 295 | 17,571 |
-| Settlement pending | 8 | 85 |
-| Settlement unattempted | 0 | 7 |
-| Currently open orders | 306 | 10,492 |
-| Open status | 281 | 10,212 |
-| Partial status | 25 | 280 |
-| Lifetime accepted pct open | 46.4% | 27.3% |
-| Stored orders | 659 | 38,372 |
-| Indexed book IDs | 325 | 10,945 |
-| Pending engine fills | 0 | 0 |
+| Metric | Value |
+|---|---:|
+| Orders received | 50,556 |
+| Orders accepted | 38,372 / 50,556 (75.9%) |
+| Orders rejected | 12,184 / 50,556 (24.1%) |
+| Admission failures | 12,184 |
+| Insufficient balance rejects | 12,181 |
+| Stale cache rejects | 3 |
+| Orders matched | 18,150 / 38,372 (47.3%) |
+| Fill side events | 35,142 |
+| Settlements attempted | 17,674 / 17,681 (100.0%) |
+| Precheck passed | 17,674 / 17,674 (100.0%) |
+| Settlements reverted | 18 (0.1%) |
+| Settlement success | 17,571 |
+| Settlement pending | 85 |
+| Settlement unattempted | 7 |
+| Currently open orders | 10,492 |
+| Open status | 10,212 |
+| Partial status | 280 |
+| Lifetime accepted pct open | 27.3% |
+| Stored orders | 38,372 |
+| Indexed book IDs | 10,945 |
+| Pending engine fills | 0 |
 
 
 
