@@ -41,10 +41,10 @@ In 25% of cases, it sets the raw size to 1.5x-3x the user’s token balance. But
 
 The important mismatch is that buy admission does not check balance >= raw size. It checks:
 
-required_balance = price * size
+required_balance = ceil(price * size / WAD)
 So a buy with 1.5x raw size can still pass if the price is low enough. For example, 1.5x size at 0.40 price only requires 0.60x balance.
 
-Meaning we should not expect exactly 25% of all orders to reject. Some of the 25% “oversized” bucket can still be accepted, especially buys at lower prices. So 
+Meaning we should not expect exactly 25% of all orders to reject. Some of the 25% “oversized” bucket can still be accepted, especially buys at lower prices.
 
 
 
@@ -61,6 +61,7 @@ This summarizes the visible Rust service structure under `service/src`.
 | `engine/` | Core in-memory matching engine. It owns orders, book indexes, balance reservations, fill candidates, matching rules, and settlement state application. |
 | `tasks/` | Submodules for background task implementations. Currently this holds the settlement worker logic used by `tasks.rs`. |
 | `chain.rs` | Blockchain/RPC adapter. It reads token and vault balances, submits `matchOrders` transactions, confirms receipts, checks receipt status, and scans logs for users whose balances need refresh. |
+| `chain_tests.rs` | Dedicated tests for chain log parsing, including indexed address topic decoding and dirty-user event aggregation. |
 | `engine_tests.rs` | Dedicated tests for engine behavior, including matching priority, balance reservation, stale order pruning, market order behavior, fill claiming, and stats accounting. |
 | `main.rs` | Application entrypoint. It loads config, builds `ChainClient`, initializes shared `AppState`, starts background loops, and wires the Axum HTTP routes. |
 | `routes.rs` | HTTP route handlers for order submission, cancellation, order listing, balance views, book snapshots, and stats snapshots. |
@@ -91,6 +92,7 @@ This summarizes the visible Rust service structure under `service/src`.
 | `tasks/settlement/mod.rs` | Settlement loop coordinator. It selects sequential, receipt-concurrent, or fully concurrent settlement modes from environment config. |
 | `tasks/settlement/outcome.rs` | Settlement lifecycle handling. It prechecks fills, submits transactions, confirms receipts, applies success, and reconciles uncertain outcomes. |
 | `tasks/settlement/concurrency.rs` | Concurrency support for settlement workers, including user lock striping and reorder invalidation tracking. |
+| `tasks/settlement/requeue.rs` | Helper for claiming and enqueueing newly available fills after settlement outcomes release more matchable orders. |
 | `tasks/settlement/settlement_tests.rs` | Dedicated tests for settlement confirmation outcomes, uncertain receipts, unresolved fills, reverts, and send failures. |
 
 ```mermaid
@@ -127,12 +129,13 @@ sequenceDiagram
     participant B as Blockchain
 
     H->>R: POST /orders
+    R->>S: issue_ticket()
+
     R->>E: balance_needs_admission_refresh(user)
     R->>C: read_user_balances(user), if needed
     C-->>R: token + vault balances at block
     R->>E: apply_balance_refresh_at_block()
 
-    R->>S: issue_ticket()
     R->>S: ticket.wait_for_turn()
 
     R->>E: balance_needs_admission_refresh(user)
