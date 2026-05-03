@@ -204,6 +204,8 @@ sequenceDiagram
 
 # 4. Design choices
 
+If this were a production environment, I would also add authentication and authorization around order submission, account-scoped reads, and any operational or settlement controls.
+
 ## Harness edits
 
 The harness changes are limited to connection pooling and runtime control; they do not change the service HTTP API. The upstream harness created HTTP and RPC connections too aggressively under concurrency, which could cause runner crashes or timeouts from too many individual connections. To fix that, the harness now uses a shared `HarnessClients` struct with reusable `service: reqwest::Client` and `rpc: alloy::transports::http::reqwest::Client` clients, both configured with a 5 second timeout and a larger idle connection pool so setup, provider/reader creation, order loops, and chain loops can run higher concurrency more reliably.
@@ -237,6 +239,7 @@ That overbooking is deliberate because it lets users express multiple resting in
 ### Cache
 
 I used a hybrid cache because the service needs fresh enough balances to reject bad orders, but cannot afford to read the chain for every user on every loop. The design choice is to trust cached balances only when they are recent and clean, then use stricter refreshes before settlement. Section 9 covers the full reconciliation flow: admission refreshes, active refresh, log-based dirty marking, and pre-settlement balance checks.
+
 
 # 5. Ghost Orders and Limitations
 
