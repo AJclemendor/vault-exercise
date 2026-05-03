@@ -1,7 +1,7 @@
 # AJ - Vault Exercise submission
 
 # 1. Overview
-I used codex for formatting // spell check for this writeup but all initial versions of this were written by me before being cleaned up
+I used codex for formatting // spell check for this writeup but all initial versions of this were written by me before being cleaned up.
 
 Small note as I am not very familiar with Rust: I made a point to keep non-test files under `service/src` below 500 lines. This added some complexity in a few places where I think longer files (Particularly in the engine part) would have been easier, if I had to do it over I would take this into consideration and be a little more lenient with the file size.
 
@@ -95,6 +95,7 @@ This summarizes the visible Rust service structure under `service/src`.
 | `tasks/settlement/requeue.rs` | Helper for claiming and enqueueing newly available fills after settlement outcomes release more matchable orders. |
 | `tasks/settlement/settlement_tests.rs` | Dedicated tests for settlement confirmation outcomes, uncertain receipts, unresolved fills, reverts, and send failures. |
 
+### Service Architecture
 ```mermaid
 flowchart LR
     Client["HTTP client / harness"] --> Routes["routes.rs<br/>HTTP handlers"]
@@ -116,7 +117,7 @@ flowchart LR
     Routes --> Stats["stats.rs + engine/snapshot.rs<br/>/stats snapshots"]
 ```
 
-### Fill lifecycle
+### Order Admission and Settlement Lifecycle
 ```mermaid
 sequenceDiagram
     participant H as Harness / Client
