@@ -6,7 +6,7 @@ use crate::engine::{Engine, FillCandidate};
 use crate::runtime::receipt_tuning;
 use crate::sequencing::OrderedGate;
 use alloy::primitives::TxHash;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use std::sync::Arc;
 use tokio::sync::OwnedSemaphorePermit;
 
@@ -226,6 +226,7 @@ pub(super) fn spawn_receipt_task(
     apply_gate: Arc<OrderedGate>,
     receipt_permit: OwnedSemaphorePermit,
     unresolved_permit: OwnedSemaphorePermit,
+    post_submit_failure_policy: PostSubmitFailurePolicy,
 ) {
     tokio::spawn(async move {
         let _receipt_permit = receipt_permit;
@@ -235,7 +236,7 @@ pub(super) fn spawn_receipt_task(
             fill,
             pending,
             Some(apply_gate),
-            PostSubmitFailurePolicy::StaleBothOrders,
+            post_submit_failure_policy,
         )
         .await;
     });
@@ -328,9 +329,7 @@ async fn apply_confirmed_settlement_success(state: &AppState, fill: &FillCandida
         engine.apply_settlement_success_without_balance_prune(fill);
     }
     drop(engine);
-    if refreshed {
-        claim_and_enqueue_available_fills(state).await;
-    }
+    claim_and_enqueue_available_fills(state).await;
 }
 
 async fn abort_confirmed_reverted_settlement_with_policy(
@@ -347,6 +346,12 @@ async fn abort_confirmed_reverted_settlement_with_policy(
     }
     match policy {
         PostSubmitFailurePolicy::ReleaseOrPrune => {
+            if funded_after_failure.is_err() {
+                engine.abort_fill(fill, false, false);
+                drop(engine);
+                claim_and_enqueue_available_fills(state).await;
+                return;
+            }
             let (buyer_ok, seller_ok) = engine.prune_underfunded_fill_users(fill);
             engine.abort_fill(fill, !buyer_ok, !seller_ok);
             let should_requeue = buyer_ok && seller_ok;
@@ -433,6 +438,11 @@ pub(super) async fn refresh_for_settlement(state: &AppState, fill: &FillCandidat
         );
     }
     engine.record_pre_settlement_balance_refreshes(refresh_count);
+    if !engine.fill_balances_are_fresh(fill) {
+        return Err(anyhow!(
+            "settlement balance refresh did not cover a newer dirty cache event"
+        ));
+    }
     Ok(())
 }
 
@@ -483,6 +493,11 @@ async fn refresh_after_success(state: &AppState, fill: &FillCandidate) -> Result
             seller_balances.vault,
             seller_balances.block,
         );
+    }
+    if !engine.fill_balances_are_fresh(fill) {
+        return Err(anyhow!(
+            "post-success balance refresh did not cover a newer dirty cache event"
+        ));
     }
     Ok(())
 }

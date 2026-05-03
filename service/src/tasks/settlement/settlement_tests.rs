@@ -276,6 +276,117 @@ async fn pre_submit_refresh_failure_requeues_released_cross() {
     assert_ne!(requeued.seq, released.seq);
 }
 
+#[tokio::test]
+async fn post_success_refresh_failure_requeues_newly_available_cross() {
+    let buyer = address(1);
+    let first_seller = address(2);
+    let second_seller = address(3);
+    let mut engine = Engine::new();
+    engine.apply_balance_refresh(buyer, wad(20), U256::ZERO);
+    engine.apply_balance_refresh(first_seller, wad(10), U256::ZERO);
+    engine.apply_balance_refresh(second_seller, wad(10), U256::ZERO);
+    let buy_id = submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(20),
+    );
+    submit(
+        &mut engine,
+        first_seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+    let second_sell_id = submit(
+        &mut engine,
+        second_seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+    let first_fill = engine
+        .claim_next_fill_candidate()
+        .expect("first seller should cross");
+
+    let (settlement_queue, mut settlement_rx) = mpsc::unbounded_channel();
+    let state = AppState {
+        engine: Arc::new(Mutex::new(engine)),
+        chain: test_chain_client_with_rpc("http://127.0.0.1:1"),
+        admission: Arc::new(AdmissionSequencer::new()),
+        settlement_queue,
+    };
+
+    apply_confirmed_settlement_success(&state, &first_fill).await;
+    let requeued = timeout(Duration::from_secs(1), settlement_rx.recv())
+        .await
+        .expect("released cross should be requeued after success")
+        .expect("settlement queue should stay open");
+
+    assert_eq!(requeued.buy_id, buy_id);
+    assert_eq!(requeued.sell_id, second_sell_id);
+}
+
+#[tokio::test]
+async fn release_policy_keeps_related_inflight_fill_when_refresh_is_inconclusive() {
+    let buyer = address(1);
+    let first_seller = address(2);
+    let second_seller = address(3);
+    let mut engine = Engine::new();
+    engine.apply_balance_refresh(buyer, wad(20), U256::ZERO);
+    engine.apply_balance_refresh(first_seller, wad(10), U256::ZERO);
+    engine.apply_balance_refresh(second_seller, wad(10), U256::ZERO);
+    submit(
+        &mut engine,
+        first_seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+    submit(
+        &mut engine,
+        second_seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(10),
+    );
+    let admission = engine
+        .submit_order_and_claim_fills(SubmitOrderRequest {
+            user: buyer,
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            price: wad(1),
+            size: wad(20),
+        })
+        .expect("large taker should be accepted");
+    assert_eq!(admission.fills.len(), 2);
+
+    let (settlement_queue, _settlement_rx) = mpsc::unbounded_channel();
+    let state = AppState {
+        engine: Arc::new(Mutex::new(engine)),
+        chain: test_chain_client_with_rpc("http://127.0.0.1:1"),
+        admission: Arc::new(AdmissionSequencer::new()),
+        settlement_queue,
+    };
+
+    abort_confirmed_reverted_settlement_with_policy(
+        &state,
+        &admission.fills[0],
+        PostSubmitFailurePolicy::ReleaseOrPrune,
+    )
+    .await;
+
+    let engine = state.engine.lock().await;
+    assert!(!engine.fill_still_pending(&admission.fills[0]));
+    assert!(engine.fill_still_pending(&admission.fills[1]));
+}
+
 fn test_chain_client() -> ChainClient {
     test_chain_client_with_rpc("http://127.0.0.1:8545")
 }

@@ -48,6 +48,9 @@ impl Engine {
         let Some(balance) = self.balances.get(&user) else {
             return;
         };
+        if balance.dirty || balance.last_refresh.is_none() {
+            return;
+        }
         if balance.reserved <= balance.real {
             return;
         }

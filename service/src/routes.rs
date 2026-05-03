@@ -29,12 +29,11 @@ pub(crate) async fn submit_order(
         let mut engine = state.engine.lock().await;
         engine.submit_order_and_claim_fills(request)?
     };
-    for (index, fill) in admission.fills.iter().cloned().enumerate() {
+    let order_id = admission.response.order_id.clone();
+    for fill in admission.fills.iter().cloned() {
         if state.settlement_queue.send(fill).is_err() {
             let mut engine = state.engine.lock().await;
-            for unsent in &admission.fills[index..] {
-                engine.abort_fill(unsent, false, false);
-            }
+            engine.abort_admission_after_queue_failure(&order_id, &admission.fills);
             return Err(ApiError::Chain("settlement queue is closed".into()));
         }
     }
@@ -143,3 +142,7 @@ fn json_error(err: JsonRejection) -> ApiError {
 fn query_error(err: QueryRejection) -> ApiError {
     ApiError::BadRequest(format!("invalid query string: {err}"))
 }
+
+#[cfg(test)]
+#[path = "routes_tests.rs"]
+mod tests;

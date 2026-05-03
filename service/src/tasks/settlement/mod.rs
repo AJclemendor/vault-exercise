@@ -193,6 +193,7 @@ async fn receipt_concurrent_settlement_loop(
                     apply_gate.clone(),
                     receipt_permit,
                     unresolved_permit,
+                    PostSubmitFailurePolicy::ReleaseOrPrune,
                 );
             }
         }
@@ -213,6 +214,7 @@ async fn concurrent_settlement_loop(
     let reorder_state = Arc::new(PreSubmitReorderState::new());
 
     loop {
+        let claim_generation = reorder_state.generation();
         let first_worker_permit = worker_permits
             .clone()
             .acquire_owned()
@@ -232,7 +234,6 @@ async fn concurrent_settlement_loop(
             drop(first_inflight_permit);
             break;
         };
-        let claim_generation = reorder_state.generation();
         let mut fills = Vec::with_capacity(capacity);
         fills.push(first_fill);
         while fills.len() < capacity {

@@ -5,7 +5,7 @@ use crate::types::{
 };
 
 use super::math::{reservation_for, sub_or_zero};
-use super::{Engine, Order, OrderAdmission};
+use super::{Engine, FillCandidate, Order, OrderAdmission};
 
 impl Engine {
     pub(crate) fn submit_order(
@@ -158,6 +158,17 @@ impl Engine {
 
         self.terminal_order(order_id, OrderStatus::Cancelled);
         Ok(())
+    }
+
+    pub(crate) fn abort_admission_after_queue_failure(
+        &mut self,
+        order_id: &str,
+        fills: &[FillCandidate],
+    ) {
+        for fill in fills {
+            self.abort_fill(fill, false, false);
+        }
+        let _ = self.cancel_order(order_id);
     }
 
     pub(crate) fn open_orders(&self, user: Option<Address>) -> Vec<OrderView> {

@@ -112,6 +112,66 @@ fn log_events_already_covered_by_refresh_do_not_mark_cache_dirty() {
 }
 
 #[test]
+fn dirty_cached_balance_does_not_prune_live_orders() {
+    let mut engine = Engine::new();
+    let buyer = address(1);
+
+    engine.apply_balance_refresh_at_block(buyer, wad(100), U256::ZERO, 10);
+    let buy_id = submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(90),
+    );
+    engine.mark_dirty_at_block(buyer, 12);
+    engine.apply_balance_refresh_at_block(buyer, wad(80), U256::ZERO, 11);
+
+    assert!(engine.balance_view(buyer).stale);
+    engine.prune_user_to_balance(buyer, None);
+
+    assert_eq!(engine.orders[&buy_id].status, OrderStatus::Open);
+}
+
+#[test]
+fn stale_fill_candidate_cannot_mutate_reclaimed_fill() {
+    let mut engine = Engine::new();
+    let buyer = address(1);
+    let seller = address(2);
+    engine.apply_balance_refresh(buyer, wad(10), U256::ZERO);
+    engine.apply_balance_refresh(seller, wad(10), U256::ZERO);
+
+    submit(
+        &mut engine,
+        buyer,
+        Side::Buy,
+        OrderType::Limit,
+        wad(1),
+        wad(1),
+    );
+    submit(
+        &mut engine,
+        seller,
+        Side::Sell,
+        OrderType::Limit,
+        wad(1),
+        wad(1),
+    );
+
+    let first = engine.next_fill_candidate().expect("orders should cross");
+    engine.abort_fill(&first, false, false);
+    let second = engine
+        .next_fill_candidate()
+        .expect("orders should re-cross");
+
+    assert_ne!(first.seq, second.seq);
+    assert!(!engine.fill_still_pending(&first));
+    engine.abort_fill(&first, false, false);
+    assert!(engine.fill_still_pending(&second));
+}
+
+#[test]
 fn direct_balance_view_does_not_mutate_cached_balance_state() {
     let mut engine = Engine::new();
     let user = address(1);

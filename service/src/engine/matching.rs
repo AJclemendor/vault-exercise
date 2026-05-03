@@ -271,6 +271,15 @@ impl Engine {
     }
 
     pub(crate) fn fill_still_pending(&self, fill: &FillCandidate) -> bool {
+        let Some(tracked) = self.in_flight_fills.get(&fill.seq) else {
+            return false;
+        };
+        if tracked.buy_id != fill.buy_id
+            || tracked.sell_id != fill.sell_id
+            || tracked.fill_size != fill.fill_size
+        {
+            return false;
+        }
         let Some(buy) = self.orders.get(&fill.buy_id) else {
             return false;
         };
@@ -304,9 +313,17 @@ impl Engine {
         let Some(balance) = self.balances.get(&user) else {
             return false;
         };
+        if balance.dirty || balance.last_refresh.is_none() {
+            return false;
+        }
         self.required_balance_after_fill_for_user(fill, user)
             .map(|required| balance.real >= required)
             .unwrap_or(false)
+    }
+
+    pub(crate) fn fill_balances_are_fresh(&self, fill: &FillCandidate) -> bool {
+        self.balance_cache_is_fresh(fill.buyer)
+            && (fill.seller == fill.buyer || self.balance_cache_is_fresh(fill.seller))
     }
 
     fn required_balance_after_fill_for_user(
@@ -437,6 +454,9 @@ impl Engine {
     }
 
     pub(crate) fn abort_fill(&mut self, fill: &FillCandidate, stale_buy: bool, stale_sell: bool) {
+        if !self.fill_still_pending(fill) {
+            return;
+        }
         self.untrack_in_flight_fill(fill.seq);
 
         if stale_buy {

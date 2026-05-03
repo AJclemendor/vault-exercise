@@ -23,6 +23,13 @@ impl Engine {
         }
     }
 
+    pub(crate) fn balance_cache_is_fresh(&self, user: Address) -> bool {
+        self.balances
+            .get(&user)
+            .map(|balance| !balance.dirty && balance.last_refresh.is_some())
+            .unwrap_or(false)
+    }
+
     #[cfg(test)]
     pub(crate) fn apply_balance_refresh(&mut self, user: Address, real: U256, vault: U256) {
         self.apply_balance_refresh_at_block(user, real, vault, u64::MAX);
