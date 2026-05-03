@@ -282,28 +282,14 @@ A further improvement would be a final `eth_call` simulation of the exact `Vault
 
 The service validates each new order against a fresh-enough on-chain token balance. The admission path is:
 
-`POST /orders` -> issue admission ticket -> wait for turn -> refresh balance if missing, dirty, or too old -> validate and reserve.
+`POST /orders` -> issue admission ticket -> refresh balance if missing, dirty, or too old -> wait for turn -> refresh/check again -> validate and reserve.
 
-Admission rejects zero size/price, reservation overflow, stale balance after attempted refresh, or insufficient hard-available balance.
-
-In the current service/contract model there are no maker or taker fees, so reservation math is:
+Admission rejects zero size/price, reservation overflow, stale balance after attempted refresh, or insufficient hard-available balance. In the current service/contract model there are no maker or taker fees, so reservation math is:
 
 - Buy reserve: `ceil(price * size / WAD)`
 - Sell reserve: `size`
 
-Hard-available balance means real on-chain token balance minus hard locks. Market orders and in-flight fills are hard locks; resting limit orders are not fully hard-locked for future admission.
-
-### Market Orders
-
-Market orders must be fully affordable at admission. They cross immediately against available older resting limits. Any unmatched remainder is cancelled, while any matched in-flight amount stays hard-locked until settlement succeeds, fails, or is released.
-
-Because market orders create immediate settlement risk, accepting one can make the user's older resting limits over-reserved. In that case, the engine prunes eligible sibling orders by marking them stale.
-
-### Limit Orders
-
-Limit orders add their full notional or base requirement to `reserved`, but resting limits are not hard locks for later limit admission. This means a user with `$100` can place multiple individually affordable resting limits, such as ten `$90` orders, and become over-reserved.
-
-That overbooking is deliberate: it lets users ladder quotes and improves book depth. The tradeoff is that some visible liquidity can become stale after fills or balance changes, so the service prunes or stales live orders after refreshes, successful settlements, and failed settlement paths when refreshed `reserved > real`.
+Hard-available balance means real on-chain token balance minus hard locks. Market orders and in-flight fills count as hard locks; resting limit orders increase `reserved` but are not fully hard-locked for future limit-order admission. Section 4 covers the accounting tradeoff for that choice, and Section 7 covers how marketable orders cross the book.
 
 If fees were added later, they would need to be included in the reservation formula. For example, a buyer-side fee would make buy reserve roughly:
 
