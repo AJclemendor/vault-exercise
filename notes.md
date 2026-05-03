@@ -18,9 +18,11 @@ Also, my eyesight is lowkey dying, so I tend to log some things with color and f
 | Orders rejected (admission failures)                   | 2,160 / 10,561 (20.5%)            | 4,106 / 20,538 (20.0%)            | 6,553 / 30,469 (21.5%)             | 8,993 / 40,384 (22.3%)              | 10,753 / 50,375 (21.3%)             |
 | Orders matched                                         | 4,692 / 8,401 (55.9%)             | 8,493 / 16,432 (51.7%)            | 11,906 / 23,916 (49.8%)            | 14,926 / 31,391 (47.5%)             | 17,908 / 39,622 (45.2%)             |
 | Settlements attempted (regardless of outcome)          | 4,471 / 4,471 candidates (100.0%) | 8,084 / 8,084 candidates (100.0%) | 11,381 / 11,401 candidates (99.8%) | 14,323 / 14,324 candidates (100.0%) | 17,064 / 17,064 candidates (100.0%) |
-| Settlements reverted (out of successful settlements) | 7 / 4,412 successful (0.2%)       | 12 / 8,012 successful (0.1%)      | 18 / 11,298 successful (0.2%)      | 25 / 14,194 successful (0.2%)       | 33 / 16,932 successful (0.2%)       |
+| Settlements reverted (captured run: out of successful settlements) | 7 / 4,412 successful (0.2%)       | 12 / 8,012 successful (0.1%)      | 18 / 11,298 successful (0.2%)      | 25 / 14,194 successful (0.2%)       | 33 / 16,932 successful (0.2%)       |
 | Currently open orders                                  | 1,523                             | 2,104                             | 3,940                              | 5,430                               | 1,795                               |
 
+
+The current service log labels `settlements_reverted` as a percentage of settlement transaction attempts, not successful settlements. I left the captured table values above on their original denominator because this run was recorded before that logging label was cleaned up.
 
 ## Notes about the adversarial harness
 
@@ -66,7 +68,8 @@ This summarizes the visible Rust service structure under `service/src`.
 | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
 | `engine/mod.rs`      | Defines the main `Engine`, internal `Order` and `BalanceState` models, fill candidates, and module layout.                                      |
 | `engine/orders.rs`   | Handles order admission, validation, reservation, cancellation, visible open order listing, and terminal order state transitions.               |
-| `engine/matching.rs` | Finds crossing orders, prepares fill candidates, manages in-flight fill state, applies successful settlements, and aborts failed fills.         |
+| `engine/matching.rs` | Finds crossing orders, prepares fill candidates, applies successful settlements, and aborts failed fills.                                       |
+| `engine/inflight.rs` | Tracks in-flight fill candidates and releases related in-flight order state when fills abort or orders become terminal.                         |
 | `engine/book.rs`     | Maintains limit-order price indexes and builds public book snapshots with bids, asks, spread, and midpoint.                                     |
 | `engine/balances.rs` | Manages cached balances, dirty markers, refresh freshness, user balance views, and pruning when cached balances no longer support reservations. |
 | `engine/exposure.rs` | Computes hard-locked funds and checks whether users can safely keep live or in-flight orders after fills.                                       |
@@ -148,7 +151,12 @@ sequenceDiagram
     loop each fill from admission
         R->>Q: settlement_queue.send(fill)
     end
-    R-->>H: OrderResponse
+    alt settlement queue send fails
+        R->>E: abort_admission_after_queue_failure(order_id, fills)
+        R-->>H: 503 Chain error
+    else all fills enqueued
+        R-->>H: OrderResponse
+    end
 
     T->>Q: fill_rx.recv()
     Q-->>T: FillCandidate
@@ -157,6 +165,7 @@ sequenceDiagram
     T->>C: read_user_balances(buyer/seller)
     C-->>T: fresh balances
     T->>E: apply_balance_refresh_at_block()
+    T->>E: fill_balances_are_fresh()
     T->>E: prune_underfunded_fill_users()
     T->>E: record_settlement_tx_attempt()
 
@@ -167,7 +176,11 @@ sequenceDiagram
 
     alt success
         T->>C: refresh_after_success()
-        T->>E: apply_settlement_success()
+        alt post-success refresh succeeds
+            T->>E: apply_settlement_success()
+        else post-success refresh fails or stays dirty
+            T->>E: mark_dirty() + apply_settlement_success_without_balance_prune()
+        end
         T->>E: claim_fill_batch()
         E-->>T: newly available fills
         T->>Q: settlement_queue.send(requeued fills)
@@ -289,11 +302,13 @@ The engine stores full order state in `orders: HashMap<String, Order>`. The publ
 
 `BTreeMap` keeps prices sorted, so bids can be walked from highest to lowest and asks from lowest to highest. Each price level stores order ids in a `VecDeque`, which preserves FIFO ordering within the same price level. Matching and snapshots lazily clean stale index entries, so the indexes may temporarily contain filled, cancelled, stale, or in-flight order ids, but only live and available limit orders are used.
 
-The current flow is: match synchronously, settle asynchronously. `POST /orders` refreshes admission balance if needed, waits for the admission ticket, submits the order through `submit_order_and_claim_fills(...)`, and immediately sends any generated `FillCandidate`s to the settlement queue. Settlement workers later refresh balances again, submit `Vault.matchOrders(...)`, confirm receipts, and apply success or abort/revert handling.
+The current flow is: match synchronously, settle asynchronously. `POST /orders` refreshes admission balance if needed, waits for the admission ticket, submits the order through `submit_order_and_claim_fills(...)`, and immediately sends any generated `FillCandidate`s to the settlement queue. If the queue is closed, the route aborts all generated fills, cancels the just-submitted order, and returns a chain error. Settlement workers later refresh balances again, submit `Vault.matchOrders(...)`, confirm receipts, and apply success or abort/revert handling.
 
 For market orders, `POST /orders` immediately walks the opposite book best-price-first and creates fill candidates against available older resting limits. Any unmatched remainder is cancelled before the response returns. Market orders never rest in the book and are hidden from `GET /orders` while their matched amount is waiting for settlement. If a market order matched, the engine keeps internal in-flight state so settlement success, revert, or abort can update reservations and fill state safely.
 
 For limit orders, `POST /orders` immediately crosses any marketable quantity against the opposite book before indexing the new order. After that, the order is inserted into the limit-order index. Public book depth only counts live, available limit liquidity from users without an in-flight order, so in-flight matched quantity is not exposed as resting depth.
+
+The engine also tracks in-flight fills by sequence. A stale fill candidate is ignored if the tracked candidate no longer exists or no longer matches the same buy order, sell order, and fill size. This prevents an older worker from mutating a released and re-claimed cross.
 
 The tradeoff is that settlement can still fail after off-chain matching because balances or allowances can change before `Vault.matchOrders(...)` executes, or because transaction send, receipt, revert, or unknown-outcome handling fails. That is why the service still needs pre-settlement refresh, dirty marking, stale orders, requeue handling, and revert/abort paths. Market-order behavior is still clean from the client perspective: matching and remainder cancellation happen immediately, while chain settlement remains asynchronous.
 
@@ -307,15 +322,17 @@ After the engine creates a `FillCandidate`, a settlement worker submits it with 
 vault.matchOrders(buyer, seller, quote, base).send().await
 ```
 
-Before sending, the worker refreshes both users' on-chain balances and checks whether the fill is still fundable. If either side is underfunded after refresh and pruning, the service records a precheck failure, aborts the fill, and skips the transaction. If both sides are still funded, it records a transaction attempt and broadcasts `matchOrders`.
+Before sending, the worker refreshes both users' on-chain balances and checks whether the fill is still fundable. The refresh must also leave both users' cache entries clean; if a newer dirty event is still not covered by the refreshed block, the service treats the refresh as inconclusive, marks both users dirty, aborts the fill without submitting a transaction, and lets the requeue path find any still-valid cross. If either side is underfunded after a clean refresh and pruning, the service records a precheck failure, aborts the fill, and skips the transaction. If both sides are still funded, it records a transaction attempt and broadcasts `matchOrders`.
 
 After broadcast, settlement has three main outcomes:
 
-1. **Success:** the service applies the fill, updates order state and reservations, refreshes balances, and requeues any newly available matches.
+1. **Success:** the service refreshes balances, applies the fill, updates order state and reservations, and requeues any newly available matches. If the post-success refresh fails or remains dirty, the fill is still applied, both users are marked dirty, balance pruning is skipped, and newly available matches are still requeued.
 2. **Known failure:** if sending fails before a transaction hash exists, or if the receipt confirms a revert, the service marks affected users dirty and aborts, releases, prunes, or stales orders according to the active settlement policy.
 3. **Uncertain receipt:** if a transaction hash exists but the service cannot prove success or revert, the fill remains pending and reservations stay locked while the service rechecks the receipt.
 
 The uncertain path is intentionally conservative. If later receipt checks prove success, the service applies the fill. If they prove revert, it handles the fill as a known failure. If the receipt remains unresolved after the deferred timeout, the service records an unknown outcome, marks both users dirty, stales both orders, aborts the fill, and releases reservations.
+
+We apply the release-or-prune policy for post-submit failures: a reverted fill can release cleanly or prune only the underfunded side after a successful refresh.
 
 The reason for holding locks during uncertainty is accounting safety. Once a transaction hash exists, the service cannot assume failure just because receipt lookup is temporarily unavailable. Releasing funds too early could let another fill reuse the same balance while the original transaction later succeeds on-chain.
 
@@ -334,13 +351,13 @@ On `POST /orders`, the route checks the user's cache before and after waiting fo
 The service keeps balances fresh through three paths:
 
 - **Admission refresh:** refreshes the submitting user before order admission when their cache is stale, dirty, or missing.
-- **Active refresh loop:** only considers users with reserved balances, prioritizing dirty entries first and then the oldest stale entries. After refresh, it prunes orders if the refreshed balance no longer supports the user's reservations.
+- **Active refresh loop:** only considers users with reserved balances, prioritizing dirty entries first and then the oldest stale entries. After a clean refresh, it prunes orders if the refreshed balance no longer supports the user's reservations.
 - **Log-based dirty marking:** polls token and vault logs. Transfers and matches mark both indexed users dirty; withdrawals mark the withdrawing user dirty.
 
 Dirty marking is block-aware. A refresh only clears dirty state if it was read at or after the dirty event's block, which avoids trusting an older balance read after a newer chain event.
 
-Dirty does not mean every user is refreshed immediately. It means the cached balance is no longer trusted for admission or settlement. The next admission path, pre-settlement path, or active refresh pass will refresh it before relying on it. The balance-view endpoint is separate: it reads fresh chain values for the response, but does not mutate or clear the cached balance entry.
+Dirty does not mean every user is refreshed immediately. It means the cached balance is no longer trusted for admission, settlement, or pruning. The next admission path, pre-settlement path, or active refresh pass will refresh it before relying on it. Pruning also skips dirty or never-refreshed cache entries so the engine does not stale orders based on known-old values. The balance-view endpoint is separate: it reads fresh chain values for the response, but does not mutate or clear the cached balance entry.
 
-Before settlement submission, the worker refreshes both the buyer and seller again and checks that the fill is still fundable. The service uses the repo default `receipt_concurrent` settlement path: transaction submission is still prepared and sent in fill order, while receipt confirmation can run concurrently afterward. This makes the refresh a pre-broadcast safety check before `Vault.matchOrders(...)`, while still allowing slow receipt waiting to happen off the main settlement loop.
+Before settlement submission, the worker refreshes both the buyer and seller again and checks that the fill is still fundable. If the refresh is older than a known dirty event, the worker fails closed instead of trusting the stale cache. The service uses the repo default `receipt_concurrent` settlement path: transaction submission is still prepared and sent in fill order, while receipt confirmation can run concurrently afterward. This makes the refresh a pre-broadcast safety check before `Vault.matchOrders(...)`, while still allowing slow receipt waiting to happen off the main settlement loop.
 
 This reduces stale-cache failures, but it does not eliminate the final race before the transaction lands on-chain, so settlement still needs revert and uncertain-receipt handling.
