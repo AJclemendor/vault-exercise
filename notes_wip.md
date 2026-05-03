@@ -356,6 +356,6 @@ Dirty marking is block-aware. A refresh only clears dirty state if it was read a
 
 Dirty does not mean every user is refreshed immediately. It means the cached balance is no longer trusted for admission or settlement. The next admission path, pre-settlement path, or active refresh pass will refresh it before relying on it. The balance-view endpoint is separate: it reads fresh chain values for the response, but does not mutate or clear the cached balance entry.
 
-Before settlement submission, the worker refreshes both the buyer and seller again and checks that the fill is still fundable. In concurrent settlement mode, this happens as part of the pre-submit check before the ordered transaction-submit gate, so it is a safety check before broadcast rather than always the literal final instruction before `Vault.matchOrders(...)`.
+Before settlement submission, the worker refreshes both the buyer and seller again and checks that the fill is still fundable. The service uses the repo default `receipt_concurrent` settlement path: transaction submission is still prepared and sent in fill order, while receipt confirmation can run concurrently afterward. This makes the refresh a pre-broadcast safety check before `Vault.matchOrders(...)`, while still allowing slow receipt waiting to happen off the main settlement loop.
 
 This reduces stale-cache failures, but it does not eliminate the final race before the transaction lands on-chain, so settlement still needs revert and uncertain-receipt handling.

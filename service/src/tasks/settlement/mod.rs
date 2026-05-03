@@ -20,6 +20,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const USER_SETTLEMENT_LOCK_STRIPES: usize = 256;
+const DEFAULT_SETTLEMENT_MODE: &str = "receipt_concurrent";
 
 type PendingSettlement = PendingTransactionBuilder<Ethereum>;
 
@@ -31,19 +32,16 @@ enum SettlementMode {
 }
 
 impl SettlementMode {
-    fn from_env() -> Self {
-        match env::var("SETTLEMENT_MODE")
-            .unwrap_or_else(|_| "receipt_concurrent".into())
-            .to_ascii_lowercase()
-            .as_str()
-        {
+    fn default_mode() -> Self {
+        Self::parse(DEFAULT_SETTLEMENT_MODE)
+    }
+
+    fn parse(value: &str) -> Self {
+        match value {
             "sequential" => Self::Sequential,
             "receipt_concurrent" => Self::ReceiptConcurrent,
             "concurrent" => Self::Concurrent,
-            value => {
-                eprintln!("[config] unknown SETTLEMENT_MODE={value}; using receipt_concurrent");
-                Self::ReceiptConcurrent
-            }
+            _ => Self::ReceiptConcurrent,
         }
     }
 
@@ -68,7 +66,7 @@ struct SettlementConfig {
 
 impl SettlementConfig {
     fn from_env() -> Self {
-        let mode = SettlementMode::from_env();
+        let mode = SettlementMode::default_mode();
         let default_concurrency = if mode == SettlementMode::Concurrent {
             16
         } else {
